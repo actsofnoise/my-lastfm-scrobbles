@@ -1,8 +1,18 @@
 """
 Artist Genre Filter Module
 
-This module provides functionality to filter and normalize genre tags for artists
-using external dictionaries located in the genre_filter_dictionaries directory.
+This module filters and normalizes genre tags from the raw artist database
+and creates/updates the filtered artist database.
+
+BEHAVIOR:
+- If artist is new: insert all filtered data (genres, nationality, image)
+- If artist exists:
+    - If missing image: copy from raw database
+    - If missing nationality: copy from raw database
+    - If missing genres (no genre_1): filter and save genres
+    - Otherwise: skip (already complete)
+- Never overwrite existing data
+- Preserve id_artist (same as raw database)
 """
 
 import sqlite3
@@ -10,7 +20,7 @@ import os
 import sys
 import re
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Dict
 
 # Add the genre_filter_dictionaries directory to path
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'genre_filter_dictionaries'))
@@ -19,8 +29,8 @@ from genre_dict import GENRE_DICT, GENERIC_TAGS
 from nationality_dict import NATIONALITY_TAGS
 
 # Database paths
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '0_artist_raw.db')
-OUTPUT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '1_artist_genres.db')
+RAW_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '0_artist_raw.db')
+FILTERED_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '1_artist_genres.db')
 
 
 # ============================================
@@ -78,13 +88,6 @@ def is_artist_keyword(tag: str) -> bool:
 def is_artist_name_tag(tag: str, artist_name: str) -> bool:
     """
     Check if a tag is the artist's name (e.g., 'pink floyd' as a tag for Pink Floyd).
-    
-    Args:
-        tag: The tag to check
-        artist_name: The artist's name to compare against
-        
-    Returns:
-        True if the tag matches the artist name, False otherwise
     """
     if not tag or not artist_name:
         return False
@@ -92,29 +95,19 @@ def is_artist_name_tag(tag: str, artist_name: str) -> bool:
     tag_clean = tag.lower().strip()
     artist_clean = artist_name.lower().strip()
     
-    # Direct match
     if tag_clean == artist_clean:
         return True
     
-    # Check if tag is a substring of artist name (e.g., 'pink' for 'Pink Floyd')
     if len(tag_clean) >= 3 and tag_clean in artist_clean:
         return True
     
-    # Check if artist name is a substring of tag (e.g., 'floyd' for 'Pink Floyd')
     if len(artist_clean) >= 3 and artist_clean in tag_clean:
         return True
     
-    # Check for common variations
     common_words = {'the', 'and', 'of', 'for', 'with', 'on', 'at', 'from', 'by'}
+    tag_words = set(tag_clean.split()) - common_words
+    artist_words = set(artist_clean.split()) - common_words
     
-    tag_words = set(tag_clean.split())
-    artist_words = set(artist_clean.split())
-    
-    # Remove common words
-    tag_words = tag_words - common_words
-    artist_words = artist_words - common_words
-    
-    # Check if any significant word matches
     if tag_words and artist_words:
         for tw in tag_words:
             for aw in artist_words:
@@ -125,49 +118,32 @@ def is_artist_name_tag(tag: str, artist_name: str) -> bool:
 
 
 def normalize_genre(tag: str) -> str:
-    """
-    Normalize a genre tag using the GENRE_DICT.
-    Returns the normalized genre in lowercase.
-    """
+    """Normalize a genre tag using the GENRE_DICT. Returns lowercase."""
     tag_lower = tag.lower()
     if tag_lower in GENRE_DICT:
         return GENRE_DICT[tag_lower].lower()
-    return tag.lower()
+    return tag_lower
 
 
 def should_keep_tag(tag: str, artist_name: str = None) -> bool:
-    """
-    Determine if a tag should be kept after filtering.
-    
-    Args:
-        tag: The tag to evaluate
-        artist_name: The artist's name (to discard artist-name tags)
-        
-    Returns:
-        True if the tag should be kept, False otherwise
-    """
+    """Determine if a tag should be kept after filtering."""
     if not tag or not tag.strip():
         return False
     
     tag_lower = tag.lower()
     
-    # Discard nationalities
     if is_nationality_tag(tag_lower):
         return False
     
-    # Discard decades
     if is_decade_tag(tag_lower):
         return False
     
-    # Discard generic tags
     if is_generic_tag(tag_lower):
         return False
     
-    # Discard artist keywords
     if is_artist_keyword(tag_lower):
         return False
     
-    # Discard tags that are the artist's name
     if artist_name and is_artist_name_tag(tag, artist_name):
         return False
     
@@ -175,26 +151,10 @@ def should_keep_tag(tag: str, artist_name: str = None) -> bool:
 
 
 def filter_and_normalize_genres(raw_tags: List[str], artist_name: str = None) -> List[str]:
-    """
-    Filter and normalize a list of genre tags.
-    
-    Steps:
-    1. Normalize each tag using GENRE_DICT (returns lowercase)
-    2. Filter out unwanted tags (nationality, decade, generic, artist keywords, artist name)
-    3. Remove duplicates (case-insensitive)
-    4. Return unique, clean genres (all lowercase)
-    
-    Args:
-        raw_tags: List of raw genre tags from Last.fm
-        artist_name: The artist's name (to discard artist-name tags)
-        
-    Returns:
-        List of filtered and normalized genres (all lowercase)
-    """
+    """Filter and normalize a list of genre tags. Returns unique, clean genres (lowercase)."""
     if not raw_tags:
         return []
     
-    # Step 1: Normalize all tags (returns lowercase)
     normalized = []
     for tag in raw_tags:
         if tag and isinstance(tag, str):
@@ -202,13 +162,11 @@ def filter_and_normalize_genres(raw_tags: List[str], artist_name: str = None) ->
             if normalized_tag:
                 normalized.append(normalized_tag)
     
-    # Step 2: Filter unwanted tags
     filtered = []
     for tag in normalized:
         if should_keep_tag(tag, artist_name):
             filtered.append(tag)
     
-    # Step 3: Remove duplicates (case-insensitive)
     seen = set()
     unique_genres = []
     for tag in filtered:
@@ -230,11 +188,68 @@ def get_top_n_genres(raw_tags: List[str], artist_name: str = None, n: int = 5) -
 # DATABASE FUNCTIONS
 # ============================================
 
+def ensure_filtered_schema(conn):
+    """Create or update the filtered Artist table schema."""
+    cursor = conn.cursor()
+    
+    # Check if table exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Artist'")
+    if not cursor.fetchone():
+        cursor.execute('''
+            CREATE TABLE Artist (
+                id_artist   INTEGER PRIMARY KEY,
+                name        TEXT    NOT NULL UNIQUE,
+                nationality TEXT,
+                artist_image_url TEXT,
+                genre_1     TEXT,
+                genre_2     TEXT,
+                genre_3     TEXT,
+                genre_4     TEXT,
+                genre_5     TEXT,
+                last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE INDEX idx_artist_name_filtered ON Artist (name)')
+        conn.commit()
+        return
+    
+    # Table exists: add missing columns
+    cursor.execute("PRAGMA table_info(Artist)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    
+    if 'artist_image_url' not in existing_columns:
+        cursor.execute('ALTER TABLE Artist ADD COLUMN artist_image_url TEXT')
+        print("   ✅ Added column: artist_image_url")
+    
+    if 'genre_1' not in existing_columns:
+        # If old version had 'genre' column, rename it
+        if 'genre' in existing_columns:
+            cursor.execute('ALTER TABLE Artist RENAME COLUMN genre TO genre_1')
+            print("   ✅ Renamed column: genre → genre_1")
+        else:
+            cursor.execute('ALTER TABLE Artist ADD COLUMN genre_1 TEXT')
+            print("   ✅ Added column: genre_1")
+    
+    for n in range(2, 6):
+        col = f'genre_{n}'
+        if col not in existing_columns:
+            cursor.execute(f'ALTER TABLE Artist ADD COLUMN {col} TEXT')
+            print(f"   ✅ Added column: {col}")
+    
+    # Ensure index exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_artist_name_filtered'")
+    if not cursor.fetchone():
+        cursor.execute('CREATE INDEX idx_artist_name_filtered ON Artist (name)')
+        print("   ✅ Added index: idx_artist_name_filtered")
+    
+    conn.commit()
+
+
 def get_raw_artists(conn):
-    """Get all artists with their raw genres from the raw database."""
+    """Get all artists from the raw database."""
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT id_artist, name, nationality,
+        SELECT id_artist, name, nationality, artist_image_url,
                genre_1, genre_2, genre_3, genre_4, genre_5,
                genre_6, genre_7, genre_8, genre_9, genre_10,
                genre_11, genre_12, genre_13, genre_14, genre_15
@@ -246,74 +261,104 @@ def get_raw_artists(conn):
         artist_id = row[0]
         name = row[1]
         nationality = row[2]
+        image_url = row[3]
         # Collect non-None genres
         raw_genres = []
-        for i in range(3, 18):  # genre_1 to genre_15
+        for i in range(4, 19):  # genre_1 to genre_15
             if row[i] is not None:
                 raw_genres.append(row[i])
         artists.append({
             'id': artist_id,
             'name': name,
             'nationality': nationality,
+            'image_url': image_url,
             'raw_genres': raw_genres
         })
     
     return artists
 
 
-def create_filtered_schema(conn):
-    """Create the filtered Artist table."""
+def get_filtered_artist(conn, artist_id):
+    """Get an artist from the filtered database by id."""
     cursor = conn.cursor()
-    
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Artist (
-            id_artist   INTEGER PRIMARY KEY,
-            name        TEXT    NOT NULL UNIQUE,
-            nationality TEXT,
-            genre_1     TEXT,
-            genre_2     TEXT,
-            genre_3     TEXT,
-            genre_4     TEXT,
-            genre_5     TEXT,
-            last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+        SELECT id_artist, name, nationality, artist_image_url,
+               genre_1, genre_2, genre_3, genre_4, genre_5
+        FROM Artist
+        WHERE id_artist = ?
+    ''', (artist_id,))
+    row = cursor.fetchone()
+    if not row:
+        return None
     
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_artist_name_filtered ON Artist (name)')
-    conn.commit()
+    return {
+        'id': row[0],
+        'name': row[1],
+        'nationality': row[2],
+        'image_url': row[3],
+        'genres': [row[4], row[5], row[6], row[7], row[8]]  # genre_1 to genre_5
+    }
 
 
-def save_filtered_artist(conn, artist_id, name, nationality, genres):
-    """Save a filtered artist to the database (genres already in lowercase)."""
-    # Pad genres to exactly 5
+def insert_filtered_artist(conn, artist_id, name, nationality, image_url, genres):
+    """Insert a new artist into the filtered database."""
     while len(genres) < 5:
         genres.append(None)
     
     cursor = conn.cursor()
     cursor.execute('''
-        INSERT OR REPLACE INTO Artist (id_artist, name, nationality, genre_1, genre_2, genre_3, genre_4, genre_5, last_update)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (artist_id, name, nationality, genres[0], genres[1], genres[2], genres[3], genres[4]))
+        INSERT INTO Artist (id_artist, name, nationality, artist_image_url,
+                            genre_1, genre_2, genre_3, genre_4, genre_5, last_update)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (artist_id, name, nationality, image_url,
+          genres[0], genres[1], genres[2], genres[3], genres[4]))
     conn.commit()
 
 
-def get_already_filtered_ids(conn) -> set:
-    """Return the set of id_artist already present in the filtered database.
-
-    Used to skip artists that were already processed in a previous run,
-    so they are never reprocessed or overwritten.
+def update_filtered_artist(conn, artist_id, nationality=None, image_url=None, genres=None):
     """
+    Update only the fields that are provided (not None).
+    Returns True if anything was updated.
+    """
+    updates = []
+    params = []
+    
+    if nationality is not None:
+        updates.append("nationality = ?")
+        params.append(nationality)
+    
+    if image_url is not None:
+        updates.append("artist_image_url = ?")
+        params.append(image_url)
+    
+    if genres is not None:
+        while len(genres) < 5:
+            genres.append(None)
+        updates.append("genre_1 = ?")
+        params.append(genres[0])
+        updates.append("genre_2 = ?")
+        params.append(genres[1])
+        updates.append("genre_3 = ?")
+        params.append(genres[2])
+        updates.append("genre_4 = ?")
+        params.append(genres[3])
+        updates.append("genre_5 = ?")
+        params.append(genres[4])
+    
+    if not updates:
+        return False
+    
+    updates.append("last_update = CURRENT_TIMESTAMP")
+    params.append(artist_id)
+    
     cursor = conn.cursor()
-    cursor.execute('SELECT id_artist FROM Artist')
-    return {row[0] for row in cursor.fetchall()}
-
-
-def get_filtered_stats(conn):
-    """Get statistics from the filtered database."""
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM Artist')
-    total = cursor.fetchone()[0]
-    return total
+    cursor.execute(f'''
+        UPDATE Artist
+        SET {', '.join(updates)}
+        WHERE id_artist = ?
+    ''', params)
+    conn.commit()
+    return True
 
 
 # ============================================
@@ -321,95 +366,147 @@ def get_filtered_stats(conn):
 # ============================================
 
 def process_and_filter_artists():
-    """Process raw artists and generate filtered database."""
+    """Process raw artists and generate/update the filtered database."""
     
     print("=" * 60)
     print("ARTIST GENRE FILTER")
     print("=" * 60)
     
     # Check if raw database exists
-    if not os.path.exists(DB_PATH):
-        print(f"❌ Raw database not found: {DB_PATH}")
+    if not os.path.exists(RAW_DB_PATH):
+        print(f"❌ Raw database not found: {RAW_DB_PATH}")
         print("   Please run 0_artist_db_raw.py first.")
         return
     
-    # Connect to raw database
-    print(f"📂 Reading from: {DB_PATH}")
-    raw_conn = sqlite3.connect(DB_PATH)
+    # Connect to databases
+    print(f"📂 Reading from: {RAW_DB_PATH}")
+    raw_conn = sqlite3.connect(RAW_DB_PATH)
     raw_conn.row_factory = sqlite3.Row
     
-    # Connect to output database (in current directory)
-    print(f"📂 Writing to: {OUTPUT_DB_PATH}")
-    out_conn = sqlite3.connect(OUTPUT_DB_PATH)
+    print(f"📂 Writing to: {FILTERED_DB_PATH}")
+    filtered_conn = sqlite3.connect(FILTERED_DB_PATH)
     
-    # Create filtered schema
-    create_filtered_schema(out_conn)
-
-    # IDs already filtered in a previous run: never touch these again
-    already_filtered = get_already_filtered_ids(out_conn)
-    print(f"⏭️  {len(already_filtered)} artists already filtered (will be skipped)")
-
+    # Ensure schema
+    print("📋 Checking filtered database schema...")
+    ensure_filtered_schema(filtered_conn)
+    
     # Get all raw artists
-    artists = get_raw_artists(raw_conn)
-    print(f"🎵 Found {len(artists)} artists in raw database")
+    raw_artists = get_raw_artists(raw_conn)
+    print(f"🎵 Found {len(raw_artists)} artists in raw database")
     print("-" * 60)
-
-    processed = 0
-    skipped_existing = 0
-    skipped_no_genres = 0
-
-    for artist in artists:
-        artist_id = artist['id']
-        name = artist['name']
-
-        # Skip artists that are already in the filtered database
-        if artist_id in already_filtered:
-            print(f"⏭️  Skipping (already filtered): {name}")
-            skipped_existing += 1
+    
+    inserted = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    
+    for raw in raw_artists:
+        artist_id = raw['id']
+        name = raw['name']
+        raw_genres = raw['raw_genres']
+        raw_nationality = raw['nationality']
+        raw_image = raw['image_url']
+        
+        # Check if artist already exists in filtered database
+        filtered = get_filtered_artist(filtered_conn, artist_id)
+        
+        if filtered is None:
+            # NEW ARTIST: insert all data
+            print(f"\n🆕 New artist: {name} (ID: {artist_id})")
+            
+            # Filter genres
+            clean_genres = filter_and_normalize_genres(raw_genres, artist_name=name)
+            top_genres = clean_genres[:5]
+            
+            if not top_genres:
+                print(f"   ⚠️ No genres after filtering. Skipping insertion.")
+                errors += 1
+                continue
+            
+            # Use raw nationality/image if available, else use defaults
+            nationality = raw_nationality if raw_nationality else 'Unknown'
+            image_url = raw_image if raw_image else None
+            
+            insert_filtered_artist(filtered_conn, artist_id, name, nationality, image_url, top_genres)
+            inserted += 1
+            print(f"   ✅ Inserted with genres: {top_genres}")
+            print(f"   📍 Nationality: {nationality}")
+            print(f"   🖼️  Image: {'Yes' if image_url else 'No'}")
             continue
-
-        raw_genres = artist['raw_genres']
-        nationality = artist['nationality'] or 'Unknown'
         
-        print(f"\n🎵 Processing: {name}")
-        print(f"   Raw genres: {raw_genres}")
+        # ARTIST EXISTS: check for missing fields
+        print(f"\n🔍 Checking: {name} (ID: {artist_id})")
         
-        # Filter and normalize genres (all lowercase)
-        clean_genres = filter_and_normalize_genres(raw_genres, artist_name=name)
+        needs_update = False
+        updated_fields = []
         
-        # Get top 5 genres
-        top_genres = clean_genres[:5]
+        # Check nationality
+        if not filtered['nationality'] or filtered['nationality'] == 'Unknown':
+            if raw_nationality and raw_nationality != 'Unknown':
+                nationality = raw_nationality
+                print(f"   📍 Updating nationality: {nationality}")
+                needs_update = True
+                updated_fields.append('nationality')
+            else:
+                nationality = None
+        else:
+            nationality = None
         
-        # Skip if no genres remain after filtering
-        if not top_genres:
-            print(f"   ⚠️ No genres after filtering")
-            skipped_no_genres += 1
-            continue
+        # Check image
+        if not filtered['image_url']:
+            if raw_image:
+                image_url = raw_image
+                print(f"   🖼️  Updating image: {image_url[:50]}...")
+                needs_update = True
+                updated_fields.append('image')
+            else:
+                image_url = None
+        else:
+            image_url = None
         
-        # Save filtered artist
-        save_filtered_artist(out_conn, artist_id, name, nationality, top_genres)
-        processed += 1
+        # Check genres (if no genre_1, re-filter)
+        if not filtered['genres'][0]:  # genre_1 is None
+            clean_genres = filter_and_normalize_genres(raw_genres, artist_name=name)
+            top_genres = clean_genres[:5]
+            if top_genres:
+                print(f"   🏷️  Updating genres: {top_genres}")
+                needs_update = True
+                updated_fields.append('genres')
+            else:
+                print(f"   ⚠️ No genres after filtering. Keeping existing.")
+                top_genres = None
+        else:
+            top_genres = None
         
-        print(f"   ✅ Filtered genres: {top_genres}")
+        if needs_update:
+            update_filtered_artist(filtered_conn, artist_id, nationality, image_url, top_genres)
+            updated += 1
+            print(f"   ✅ Updated: {', '.join(updated_fields)}")
+        else:
+            print(f"   ✅ Already complete. Skipping.")
+            skipped += 1
     
     # Commit and close
-    out_conn.commit()
+    filtered_conn.commit()
     
     # Get statistics
-    total = get_filtered_stats(out_conn)
+    cursor = filtered_conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM Artist')
+    total = cursor.fetchone()[0]
     
     print("-" * 60)
     print(f"\n✅ Filtered database updated successfully")
-    print(f"📁 Location: {OUTPUT_DB_PATH}")
+    print(f"📁 Location: {FILTERED_DB_PATH}")
     print(f"📋 Table 'Artist' with filtered genres (top 5, all lowercase)")
     print(f"🎵 Total artists in filtered DB: {total}")
-    print(f"   Newly processed: {processed}")
-    print(f"   Skipped (already filtered): {skipped_existing}")
-    print(f"   Skipped (no genres after filtering): {skipped_no_genres}")
+    print(f"   New artists inserted: {inserted}")
+    print(f"   Artists updated (missing fields): {updated}")
+    print(f"   Artists skipped (already complete): {skipped}")
+    print(f"   Errors (no genres): {errors}")
     print("=" * 60)
     
     raw_conn.close()
-    out_conn.close()
+    filtered_conn.close()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-name: 2. Update Songs from Last.fm
+name: 3. Update Songs from Last.fm
 
 on:
   schedule:

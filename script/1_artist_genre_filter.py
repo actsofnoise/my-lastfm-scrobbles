@@ -211,6 +211,7 @@ def ensure_filtered_schema(conn):
         ''')
         cursor.execute('CREATE INDEX idx_artist_name_filtered ON Artist (name)')
         conn.commit()
+        print("   ✅ Created Artist table with image column")
         return
     
     # Table exists: add missing columns
@@ -465,7 +466,7 @@ def process_and_filter_artists():
             image_url = None
         
         # Check genres (if no genre_1, re-filter)
-        if not filtered['genres'][0]:  # genre_1 is None
+        if not filtered['genres'][0]:  # genre_1 is None or empty
             clean_genres = filter_and_normalize_genres(raw_genres, artist_name=name)
             top_genres = clean_genres[:5]
             if top_genres:

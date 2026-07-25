@@ -1,0 +1,57 @@
+name: 2. Update Albums
+
+on:
+  schedule:
+    # Run daily at 5:45 AM UTC (after artist genre filter)
+    - cron: '45 5 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write  # Needed to commit/push the updated database
+
+jobs:
+  update-albums:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install musicbrainzngs  # Ensure it's installed
+
+      - name: 📁 Create data directory
+        run: mkdir -p data
+
+      - name: 📂 Download artist database artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: artist-genres-database
+          path: data/
+
+      - name: 🎵 Run album database update
+        run: |
+          python script/2_album_db_raw.py
+
+      - name: 📤 Upload album database as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: albums-database-raw
+          path: data/2_albums_raw.db
+          retention-days: 7
+
+      - name: 💾 Commit and push database
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/2_albums_raw.db
+          git diff --staged --quiet || git commit -m "Actualizar 2_albums_raw.db con álbumes de MusicBrainz [skip ci]"
+          git push

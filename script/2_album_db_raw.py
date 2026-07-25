@@ -46,7 +46,7 @@ ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data',
 musicbrainzngs.set_useragent(
     "my_scrobbles",
     "1.0",
-    "https://github.com/yourusername/my-lastfm-scrobbles"
+    "https://github.com/adroguett-scratch/my-lastfm-scrobbles"
 )
 
 
@@ -71,7 +71,7 @@ def create_schema(conn):
             producer     TEXT,
             cover_url    TEXT,
             last_update  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (id_artist, title, release_year)  -- Avoid duplicates
+            UNIQUE (id_artist, title, release_year)
         )
     ''')
 
@@ -182,13 +182,13 @@ def search_artist_mbid(artist_name: str) -> Optional[str]:
 def get_artist_releases(artist_mbid: str) -> List[Dict[str, Any]]:
     """
     Get all releases (albums) for an artist from MusicBrainz.
-    Returns a list of releases with basic info.
+    Uses browse_releases (correct method).
     """
     try:
-        result = musicbrainzngs.get_artist_releases(
-            artist_mbid,
+        result = musicbrainzngs.browse_releases(
+            artist=artist_mbid,
             includes=['release-groups'],
-            limit=100  # Increase if needed
+            limit=100
         )
         releases = result.get('release-list', [])
         return releases
@@ -209,11 +209,9 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
     release_date = None
     if date_str:
         try:
-            # Try to extract year
             year_match = re.search(r'^(\d{4})', date_str)
             if year_match:
                 release_year = int(year_match.group(1))
-            # Full date if available
             if len(date_str) >= 10:
                 release_date = date_str
             else:
@@ -249,7 +247,7 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
         'album_type': album_type,
         'total_tracks': total_tracks,
         'label': label,
-        'producer': None,  # MusicBrainz doesn't have producer easily
+        'producer': None,
     }
 
 
@@ -271,10 +269,10 @@ def get_cover_url(release_mbid: str) -> Optional[str]:
 # MAIN PROCESSING FUNCTION
 # ============================================
 
-def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn, artist_conn):
+def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
     """
     Fetch and save albums for a single artist.
-    Returns (new_albums, updated_covers, skipped).
+    Returns (new_albums, updated_covers).
     """
     new_albums = 0
     updated_covers = 0
@@ -294,17 +292,13 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn, artist
     print(f"   📀 Found {len(releases)} releases")
 
     for release in releases:
-        # Skip releases without a title
         if not release.get('title'):
             continue
 
-        # Parse release data
         parsed = parse_release(release)
 
         # Check if album already exists
         if album_exists(album_conn, artist_id, parsed['title'], parsed['release_year']):
-            # If cover is missing, try to get it
-            # We'll handle cover updates separately
             continue
 
         # Get cover URL
@@ -368,7 +362,7 @@ def create_album_database():
     last_update = get_last_update_time(album_conn)
     if last_update:
         print(f"📌 Last update: {last_update}")
-        print("   Fetching albums for artists not yet processed (or missing covers)...")
+        print("   Fetching albums for artists not yet processed...")
     else:
         print("📂 New album database. Fetching all albums...")
 
@@ -376,7 +370,6 @@ def create_album_database():
 
     total_new = 0
     total_updated_covers = 0
-    total_skipped = 0
 
     for idx, artist in enumerate(artists, start=1):
         artist_id = artist['id']
@@ -384,13 +377,7 @@ def create_album_database():
 
         print(f"\n[{idx}/{len(artists)}] {artist_name} (ID: {artist_id})")
 
-        # We need a new connection to artist db for each artist? We can reuse but we closed.
-        # Reopen artist db for each iteration (or keep open)
-        artist_conn = sqlite3.connect(ARTIST_DB_PATH)
-        # But we already have artists list, no need to query again.
-        artist_conn.close()
-
-        new, covers = fetch_albums_for_artist(artist_id, artist_name, album_conn, None)
+        new, covers = fetch_albums_for_artist(artist_id, artist_name, album_conn)
         total_new += new
         total_updated_covers += covers
 

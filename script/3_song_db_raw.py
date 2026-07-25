@@ -3,7 +3,7 @@ Song Database - Raw Data Fetcher
 
 This module fetches song data from Last.fm and stores it in a SQLite database.
 It retrieves:
-- Songs (id_artist, title, duration)
+- Songs (id_artist, id_album, title, duration)
 
 Duration is fetched from:
 1. Last.fm API (primary)
@@ -23,15 +23,16 @@ import requests
 import time
 import re
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 # Database paths
-ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '0_artist_raw.db')
-SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_songs_raw.db')
+ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '1_artist_genres.db')
+ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_albums_raw.db')
+SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_songs_raw.db')
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -215,13 +216,14 @@ If you don't know, respond with '0'."""
 # ============================================
 
 def create_schema(conn):
-    """Creates the Song table with pending support."""
+    """Creates the Song table with pending support and id_album."""
     cursor = conn.cursor()
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Song (
             id_song     INTEGER PRIMARY KEY AUTOINCREMENT,
             id_artist   INTEGER NOT NULL,
+            id_album    INTEGER NOT NULL,
             title       TEXT    NOT NULL,
             duration    INTEGER,
             duration_source TEXT, -- 'lastfm', 'spotify', 'deepseek', 'pending', 'unknown'
@@ -231,18 +233,24 @@ def create_schema(conn):
         )
     ''')
 
-    # Migration: if Song already existed from an older schema version
-    # (e.g. one with 'playcount' instead of 'duration_source'/'retry_count'),
-    # add the missing columns instead of failing.
+    # Migration: add missing columns if they don't exist
     cursor.execute("PRAGMA table_info(Song)")
     columns = [row[1] for row in cursor.fetchall()]
 
+    if 'id_album' not in columns:
+        cursor.execute("ALTER TABLE Song ADD COLUMN id_album INTEGER NOT NULL DEFAULT 0")
+        print("   ✅ Added column: id_album")
+    
     if 'duration_source' not in columns:
         cursor.execute("ALTER TABLE Song ADD COLUMN duration_source TEXT")
+        print("   ✅ Added column: duration_source")
+    
     if 'retry_count' not in columns:
         cursor.execute("ALTER TABLE Song ADD COLUMN retry_count INTEGER DEFAULT 0")
+        print("   ✅ Added column: retry_count")
 
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_artist ON Song (id_artist)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_album ON Song (id_album)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_title ON Song (title)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_duration ON Song (duration)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_retry ON Song (retry_count)')
@@ -274,25 +282,44 @@ def set_last_update_time(conn, timestamp: str):
     conn.commit()
 
 
-def get_artist_id(conn, artist_name: str) -> Optional[int]:
-    cursor = conn.cursor()
-    cursor.execute('SELECT id_artist FROM Artist WHERE name = ?', (artist_name,))
-    row = cursor.fetchone()
-    return row[0] if row else None
-
-
 def load_artist_map() -> dict:
-    """Loads all artists into memory once, as {name: id_artist}.
-
-    Avoids opening a new sqlite connection to 0_artist_raw.db for every
-    single scrobble, which is very slow on large scan (thousands of scrobbles).
-    """
+    """Loads all artists into memory once, as {name: id_artist}."""
     artist_conn = sqlite3.connect(ARTIST_DB_PATH)
     cursor = artist_conn.cursor()
     cursor.execute('SELECT id_artist, name FROM Artist')
     mapping = {name: id_artist for id_artist, name in cursor.fetchall()}
     artist_conn.close()
     return mapping
+
+
+def load_album_map() -> Dict[str, Dict[str, int]]:
+    """
+    Loads all albums into memory as a nested dict:
+    {artist_name: {album_title: id_album}}
+    """
+    album_conn = sqlite3.connect(ALBUM_DB_PATH)
+    cursor = album_conn.cursor()
+    cursor.execute('''
+        SELECT a.name, al.title, al.id_album
+        FROM Album al
+        JOIN Artist a ON al.id_artist = a.id_artist
+    ''')
+    
+    album_map = {}
+    for artist_name, album_title, id_album in cursor.fetchall():
+        if artist_name not in album_map:
+            album_map[artist_name] = {}
+        album_map[artist_name][album_title] = id_album
+    
+    album_conn.close()
+    return album_map
+
+
+def get_album_id_from_title(album_map: Dict, artist_name: str, album_title: str) -> int:
+    """Get album ID from album map, return 0 if not found."""
+    if artist_name in album_map and album_title in album_map[artist_name]:
+        return album_map[artist_name][album_title]
+    return 0
 
 
 def song_exists(conn, id_artist: int, title: str) -> bool:
@@ -312,17 +339,17 @@ def get_pending_songs(conn) -> list:
     return cursor.fetchall()
 
 
-def save_song(conn, id_artist: int, title: str, duration: Optional[int] = None, 
-              source: str = 'unknown', retry_count: int = 0):
+def save_song(conn, id_artist: int, id_album: int, title: str, 
+              duration: Optional[int] = None, source: str = 'unknown', retry_count: int = 0):
     cursor = conn.cursor()
 
     if song_exists(conn, id_artist, title):
         return None
 
     cursor.execute('''
-        INSERT INTO Song (id_artist, title, duration, duration_source, retry_count, last_update)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (id_artist, title, duration, source, retry_count))
+        INSERT INTO Song (id_artist, id_album, title, duration, duration_source, retry_count, last_update)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (id_artist, id_album, title, duration, source, retry_count))
     conn.commit()
 
     return cursor.lastrowid
@@ -415,23 +442,57 @@ def fetch_scrobbles_page(page: int, limit: int = 200, from_timestamp: Optional[i
     return data
 
 
-def process_scrobble(conn, scrobble_data, artist_map: dict):
+def process_scrobble(conn, scrobble_data, artist_map: dict, album_map: dict, 
+                     artist_name_cache: dict):
     if '@attr' in scrobble_data and scrobble_data['@attr'].get('nowplaying') == 'true':
         return
 
     artist_name = scrobble_data['artist']['#text']
     song_title = scrobble_data['name']
+    
+    # Get album name from scrobble data (if available)
+    album_title = scrobble_data.get('album', {}).get('#text', '')
 
     id_artist = artist_map.get(artist_name)
 
     if not id_artist:
-        print(f"    ⚠️ Artist not found: {artist_name}")
-        return
+        # Try to find artist by partial match (cache)
+        if artist_name not in artist_name_cache:
+            # Search in artist_map keys for partial match
+            for name in artist_map:
+                if artist_name.lower() in name.lower() or name.lower() in artist_name.lower():
+                    artist_name_cache[artist_name] = name
+                    break
+            if artist_name not in artist_name_cache:
+                artist_name_cache[artist_name] = None
+        
+        matched_name = artist_name_cache.get(artist_name)
+        if matched_name:
+            id_artist = artist_map.get(matched_name)
+        
+        if not id_artist:
+            print(f"    ⚠️ Artist not found: {artist_name}")
+            return
 
     if song_exists(conn, id_artist, song_title):
         return
 
+    # Get album ID
+    id_album = 0
+    if album_title:
+        id_album = get_album_id_from_title(album_map, artist_name, album_title)
+        if id_album == 0:
+            # Try with matched artist name
+            matched_name = artist_name_cache.get(artist_name)
+            if matched_name:
+                id_album = get_album_id_from_title(album_map, matched_name, album_title)
+
     print(f"    🎵 New song: {song_title}")
+    if id_album > 0:
+        print(f"      💿 Album ID: {id_album}")
+    else:
+        print(f"      💿 No album match found")
+
     duration, source = fetch_duration_with_fallback(artist_name, song_title)
 
     if duration:
@@ -442,15 +503,13 @@ def process_scrobble(conn, scrobble_data, artist_map: dict):
         print(f"      ⏱️ Duration: Unknown [source: pending] - Will retry on next run")
 
     retry_count = 0 if source != 'pending' else 0
-    save_song(conn, id_artist, song_title, duration, source, retry_count)
+    save_song(conn, id_artist, id_album, song_title, duration, source, retry_count)
 
-    # Small delay only when the fallback chain was actually used (Spotify/DeepSeek),
-    # to avoid hammering those APIs. Last.fm hits (cheap, fast) don't need a delay.
     if source in ('spotify', 'deepseek', 'pending'):
         time.sleep(0.5)
 
 
-def retry_pending_songs(conn, artist_map: dict):
+def retry_pending_songs(conn, artist_map: dict, album_map: dict, artist_name_cache: dict):
     pending = get_pending_songs(conn)
     
     if not pending:
@@ -463,7 +522,12 @@ def retry_pending_songs(conn, artist_map: dict):
     
     retried = 0
     for id_song, id_artist, title, retry_count in pending:
-        artist_name = id_to_name.get(id_artist)
+        # Get artist name (try cache first)
+        artist_name = None
+        for name, aid in artist_map.items():
+            if aid == id_artist:
+                artist_name = name
+                break
         
         if not artist_name:
             continue
@@ -488,7 +552,6 @@ def retry_pending_songs(conn, artist_map: dict):
             ''', (id_song,))
             conn.commit()
         
-        # Same rate-limit courtesy delay as new songs
         if source in ('spotify', 'deepseek', 'pending'):
             time.sleep(0.5)
     
@@ -508,11 +571,16 @@ def fetch_all_scrobbles(conn, limit: int = 200):
         except ValueError:
             print(f"   ⚠️ Could not parse timestamp: {last_update}. Fetching all scrobbles...")
 
-    # Load all artists once instead of opening a connection per scrobble
     print("📚 Loading artist map into memory...")
     artist_map = load_artist_map()
     print(f"   {len(artist_map)} artists loaded.")
 
+    print("📚 Loading album map into memory...")
+    album_map = load_album_map()
+    total_albums = sum(len(albums) for albums in album_map.values())
+    print(f"   {total_albums} albums loaded across {len(album_map)} artists.")
+
+    artist_name_cache = {}
     page = 1
     total_processed = 0
 
@@ -534,7 +602,7 @@ def fetch_all_scrobbles(conn, limit: int = 200):
         total_pages = int(data['recenttracks']['@attr']['totalPages'])
 
         for track in tracks:
-            process_scrobble(conn, track, artist_map)
+            process_scrobble(conn, track, artist_map, album_map, artist_name_cache)
             total_processed += 1
 
         print(f"   ✅ Page {page}/{total_pages} processed. Total: {total_processed}")
@@ -546,7 +614,7 @@ def fetch_all_scrobbles(conn, limit: int = 200):
         time.sleep(0.3)
 
     print("\n🔄 Retrying pending songs...")
-    retried = retry_pending_songs(conn, artist_map)
+    retried = retry_pending_songs(conn, artist_map, album_map, artist_name_cache)
     if retried > 0:
         print(f"   ✅ Found durations for {retried} pending songs!")
 
@@ -598,8 +666,13 @@ def create_database():
 
     if not os.path.exists(ARTIST_DB_PATH):
         print(f"❌ Artist database not found: {ARTIST_DB_PATH}")
-        print("   Please run 0_artist_db_raw.py first.")
+        print("   Please run 1_artist_genre_filter.py first.")
         return
+
+    if not os.path.exists(ALBUM_DB_PATH):
+        print(f"⚠️ Album database not found: {ALBUM_DB_PATH}")
+        print("   Running without album mapping. id_album will be set to 0.")
+        print("   (Run 2_album_db_raw.py first for full album support)")
 
     os.makedirs(os.path.dirname(SONG_DB_PATH), exist_ok=True)
 

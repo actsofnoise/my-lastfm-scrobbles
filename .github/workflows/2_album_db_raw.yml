@@ -1,4 +1,4 @@
-name: 2. Update Albums
+name: 2. Update Albums from MusicBrainz
 
 on:
   schedule:
@@ -26,16 +26,9 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install musicbrainzngs  # Ensure it's installed
 
       - name: 📁 Create data directory
         run: mkdir -p data
-
-      - name: 📂 Download artist database artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: artist-genres-database
-          path: data/
 
       - name: 🎵 Run album database update
         run: |

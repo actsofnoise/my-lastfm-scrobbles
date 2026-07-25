@@ -2,12 +2,11 @@ name: 2. Update Albums from MusicBrainz
 
 on:
   schedule:
-    # Run daily at 5:45 AM UTC (after artist genre filter)
     - cron: '45 5 * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 permissions:
-  contents: write  # Needed to commit/push the updated database
+  contents: write
 
 jobs:
   update-albums:

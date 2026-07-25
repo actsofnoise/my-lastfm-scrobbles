@@ -10,11 +10,10 @@ It retrieves:
 - Label (record label)
 - Cover URL (from: Last.fm → Deezer → DeepSeek)
 
-BEHAVIOR:
-- For each artist in 1_artist_genres.db, fetch their releases from MusicBrainz.
-- Insert new albums into 2_albums_raw.db.
-- If an album already exists (by id_artist + title + release_year), skip it.
-- id_album is autoincrement, id_artist is the same as in Artist table.
+OPTIMIZATION:
+- If artist exists in Album table → fetch only releases from last 2 years.
+- If artist is new → fetch full discography.
+- Never overwrite existing albums.
 """
 
 import sqlite3
@@ -23,7 +22,7 @@ import sys
 import requests
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
@@ -57,6 +56,9 @@ musicbrainzngs.set_useragent(
     "https://github.com/adroguett-scratch/my-lastfm-scrobbles"
 )
 
+# Maximum years to look back for existing artists
+MAX_YEARS_BACK = 2
+
 
 # ============================================
 # COVER FETCHING FUNCTIONS
@@ -89,7 +91,6 @@ def get_cover_from_lastfm(artist_name: str, album_title: str) -> Optional[str]:
         for img in images:
             if img.get('size') == 'extralarge':
                 url = img.get('#text')
-                # Skip generic placeholder images
                 if url and not url.endswith('2a96fbd4b0e3e8c4.png'):
                     return url
 
@@ -200,12 +201,10 @@ def create_schema(conn):
     """Creates the Album table and handles schema migrations."""
     cursor = conn.cursor()
 
-    # Check if table exists
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Album'")
     table_exists = cursor.fetchone() is not None
 
     if not table_exists:
-        # Create full table
         cursor.execute('''
             CREATE TABLE Album (
                 id_album     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -223,9 +222,8 @@ def create_schema(conn):
                 UNIQUE (id_artist, title, release_year)
             )
         ''')
-        print("✅ Created table Album with cover_source")
+        print("✅ Created table Album")
     else:
-        # Table exists: add missing columns
         cursor.execute("PRAGMA table_info(Album)")
         existing_columns = {row[1] for row in cursor.fetchall()}
 
@@ -233,7 +231,6 @@ def create_schema(conn):
             cursor.execute('ALTER TABLE Album ADD COLUMN cover_source TEXT')
             print("✅ Added column: cover_source")
 
-        # Ensure other columns exist (optional)
         if 'cover_url' not in existing_columns:
             cursor.execute('ALTER TABLE Album ADD COLUMN cover_url TEXT')
             print("✅ Added column: cover_url")
@@ -242,12 +239,10 @@ def create_schema(conn):
             cursor.execute('ALTER TABLE Album ADD COLUMN producer TEXT')
             print("✅ Added column: producer")
 
-    # Indexes
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_artist ON Album (id_artist)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_title ON Album (title)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_release_year ON Album (release_year)')
 
-    # Metadata table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Metadata (
             key     TEXT PRIMARY KEY,
@@ -265,6 +260,14 @@ def get_artists(conn) -> List[Dict[str, Any]]:
     cursor.execute('SELECT id_artist, name FROM Artist ORDER BY id_artist')
     rows = cursor.fetchall()
     return [{'id': row[0], 'name': row[1]} for row in rows]
+
+
+def get_artist_album_count(conn, id_artist: int) -> int:
+    """Get count of albums for an artist."""
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM Album WHERE id_artist = ?', (id_artist,))
+    row = cursor.fetchone()
+    return row[0] if row else 0
 
 
 def album_exists(conn, id_artist: int, title: str, release_year: int = None) -> bool:
@@ -336,16 +339,45 @@ def search_artist_mbid(artist_name: str) -> Optional[str]:
         return None
 
 
-def get_artist_releases(artist_mbid: str) -> List[Dict[str, Any]]:
-    """Get all releases (albums) for an artist from MusicBrainz."""
+def get_artist_releases(artist_mbid: str, since_year: int = None) -> List[Dict[str, Any]]:
+    """
+    Get releases for an artist from MusicBrainz.
+    If since_year is provided, only fetch releases from that year onwards.
+    """
     try:
-        result = musicbrainzngs.browse_releases(
-            artist=artist_mbid,
-            includes=['release-groups'],
-            limit=100
-        )
-        releases = result.get('release-list', [])
-        return releases
+        # Build query with date filter if provided
+        if since_year:
+            # MusicBrainz supports date filtering in browse_releases
+            # We'll filter after fetching since the API doesn't support year filtering directly
+            result = musicbrainzngs.browse_releases(
+                artist=artist_mbid,
+                includes=['release-groups'],
+                limit=100
+            )
+            releases = result.get('release-list', [])
+            
+            # Filter releases by year
+            filtered = []
+            for release in releases:
+                date_str = release.get('date', '')
+                if date_str:
+                    year_match = re.search(r'^(\d{4})', date_str)
+                    if year_match:
+                        release_year = int(year_match.group(1))
+                        if release_year >= since_year:
+                            filtered.append(release)
+                else:
+                    # If no date, include it (we want to be safe)
+                    filtered.append(release)
+            return filtered
+        else:
+            # Fetch all releases
+            result = musicbrainzngs.browse_releases(
+                artist=artist_mbid,
+                includes=['release-groups'],
+                limit=100
+            )
+            return result.get('release-list', [])
     except Exception as e:
         print(f"      ⚠️ MusicBrainz releases error: {e}")
         return []
@@ -355,7 +387,6 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
     """Parse a MusicBrainz release dict into our format."""
     title = release.get('title', '')
 
-    # Release date
     date_str = release.get('date', '')
     release_year = None
     release_date = None
@@ -371,7 +402,6 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
         except:
             pass
 
-    # Album type
     release_group = release.get('release-group', {})
     primary_type = release_group.get('primary-type', '')
     secondary_types = release_group.get('secondary-types', [])
@@ -379,13 +409,11 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
     if secondary_types:
         album_type = f"{album_type} / {' / '.join(secondary_types)}".lower()
 
-    # Label
     label_info = release.get('label-info-list', [])
     label = None
     if label_info:
         label = label_info[0].get('label', {}).get('name', '')
 
-    # Total tracks
     medium_list = release.get('medium-list', [])
     total_tracks = 0
     for medium in medium_list:
@@ -408,22 +436,42 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================
 
 def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
-    """Fetch and save albums for a single artist."""
+    """
+    Fetch and save albums for a single artist.
+    - If artist has existing albums: fetch only releases from last 2 years.
+    - If artist is new: fetch full discography.
+    """
     new_albums = 0
+    
+    # Check if artist already has albums
+    album_count = get_artist_album_count(album_conn, artist_id)
+    
+    if album_count > 0:
+        # Artist exists: fetch only recent releases (last 2 years)
+        current_year = datetime.now().year
+        since_year = current_year - MAX_YEARS_BACK
+        print(f"   📌 Existing artist: fetching releases from {since_year} onwards")
+    else:
+        # New artist: fetch full discography
+        since_year = None
+        print(f"   📌 New artist: fetching full discography")
 
-    # 1. Get artist MBID from MusicBrainz
+    # Get artist MBID from MusicBrainz
     mbid = search_artist_mbid(artist_name)
     if not mbid:
         print(f"   ⚠️ No MusicBrainz ID found for '{artist_name}'")
         return 0
 
-    # 2. Get releases
-    releases = get_artist_releases(mbid)
+    # Get releases
+    releases = get_artist_releases(mbid, since_year)
     if not releases:
         print(f"   ⚠️ No releases found for '{artist_name}'")
         return 0
 
-    print(f"   📀 Found {len(releases)} releases")
+    if since_year:
+        print(f"   📀 Found {len(releases)} recent releases (since {since_year})")
+    else:
+        print(f"   📀 Found {len(releases)} total releases")
 
     for release in releases:
         if not release.get('title'):
@@ -431,7 +479,7 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
 
         parsed = parse_release(release)
 
-        # Skip if album already exists
+        # Skip if album already exists (prevent duplicates)
         if album_exists(album_conn, artist_id, parsed['title'], parsed['release_year']):
             continue
 
@@ -443,7 +491,6 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
         else:
             print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [no cover]")
 
-        # Save album
         save_album(
             album_conn,
             artist_id=artist_id,
@@ -472,13 +519,11 @@ def create_album_database():
     print("ALBUM DATABASE - RAW DATA FETCHER")
     print("=" * 60)
 
-    # Check if artist database exists
     if not os.path.exists(ARTIST_DB_PATH):
         print(f"❌ Artist database not found: {ARTIST_DB_PATH}")
         print("   Please run 1_artist_genre_filter.py first.")
         return
 
-    # Connect to artist database
     print(f"📂 Reading artists from: {ARTIST_DB_PATH}")
     artist_conn = sqlite3.connect(ARTIST_DB_PATH)
     artists = get_artists(artist_conn)
@@ -489,23 +534,16 @@ def create_album_database():
         return
 
     print(f"🎵 Found {len(artists)} artists")
+    print(f"📅 Only fetching releases from last {MAX_YEARS_BACK} years for existing artists")
+    print("-" * 60)
 
     # Connect to album database
     os.makedirs(os.path.dirname(ALBUM_DB_PATH), exist_ok=True)
     album_conn = sqlite3.connect(ALBUM_DB_PATH)
     create_schema(album_conn)
 
-    # Check last update time
-    last_update = get_last_update_time(album_conn)
-    if last_update:
-        print(f"📌 Last update: {last_update}")
-        print("   Fetching albums for artists not yet processed...")
-    else:
-        print("📂 New album database. Fetching all albums...")
-
-    print("-" * 60)
-
     total_new = 0
+    skipped_artists = 0
 
     for idx, artist in enumerate(artists, start=1):
         artist_id = artist['id']
@@ -514,6 +552,10 @@ def create_album_database():
         print(f"\n[{idx}/{len(artists)}] {artist_name} (ID: {artist_id})")
 
         new = fetch_albums_for_artist(artist_id, artist_name, album_conn)
+        
+        if new == 0:
+            skipped_artists += 1
+        
         total_new += new
 
         # Avoid rate limiting
@@ -534,6 +576,7 @@ def create_album_database():
     print(f"📋 Table 'Album' with album details")
     print(f"🎵 Total albums in DB: {total_albums}")
     print(f"   New albums added: {total_new}")
+    print(f"   Artists skipped (no new releases): {skipped_artists}")
     print("=" * 60)
 
     album_conn.close()

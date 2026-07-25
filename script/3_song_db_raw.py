@@ -10,10 +10,13 @@ Duration is fetched from:
 2. Spotify API (fallback 1 - optional)
 3. DeepSeek API (fallback 2 - AI)
 
-OPTIMIZATION: Songs are only fetched ONCE. If a song already exists in the database,
-it is skipped entirely (no API calls, no overwriting).
+Album is fetched from:
+1. Scrobble data (if available)
+2. Last.fm track.getInfo (fallback)
+3. MusicBrainz (fallback)
+4. DeepSeek (last resort)
 
-NEW: Songs with no duration are marked as 'pending' and will be retried on next run.
+If no album is found, id_album = 0 and album_retry_count is incremented.
 """
 
 import sqlite3
@@ -23,8 +26,16 @@ import requests
 import time
 import re
 from datetime import datetime
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from dotenv import load_dotenv
+
+# Try to import musicbrainzngs
+try:
+    import musicbrainzngs
+except ImportError:
+    print("⚠️ musicbrainzngs not installed. Installing...")
+    os.system(f"{sys.executable} -m pip install musicbrainzngs")
+    import musicbrainzngs
 
 # Load environment variables
 load_dotenv()
@@ -45,6 +56,13 @@ LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
 SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
 SPOTIFY_API_URL = 'https://api.spotify.com/v1/search'
 DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions'
+
+# Configure MusicBrainz
+musicbrainzngs.set_useragent(
+    "my_scrobbles",
+    "1.0",
+    "https://github.com/adroguett-scratch/my-lastfm-scrobbles"
+)
 
 # Spotify token cache
 spotify_token = None
@@ -201,7 +219,7 @@ If you don't know, respond with '0'."""
                 print(f"      ⚠️ DeepSeek returned a year ({duration}s) instead of duration.")
                 return None
             
-            if duration > 0 and duration < 6000:  # Sanity check: less than 100 minutes
+            if duration > 0 and duration < 6000:
                 return duration
 
         return None
@@ -209,6 +227,178 @@ If you don't know, respond with '0'."""
     except Exception as e:
         print(f"      ⚠️ DeepSeek error for '{artist_name} - {song_title}': {e}")
         return None
+
+
+# ============================================
+# ALBUM SEARCH FUNCTIONS
+# ============================================
+
+def get_album_from_lastfm_track(artist_name: str, song_title: str) -> Optional[str]:
+    """Get the album name for a track from Last.fm track.getInfo."""
+    params = {
+        'method': 'track.getInfo',
+        'artist': artist_name,
+        'track': song_title,
+        'api_key': LASTFM_API_KEY,
+        'format': 'json'
+    }
+
+    try:
+        resp = requests.get(LASTFM_API_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if 'error' in data:
+            return None
+
+        track = data.get('track', {})
+        album = track.get('album', {})
+        album_title = album.get('title')
+
+        if album_title and album_title.strip():
+            return album_title.strip()
+
+        return None
+
+    except Exception as e:
+        print(f"      ⚠️ Last.fm album lookup error: {e}")
+        return None
+
+
+def get_album_from_musicbrainz(artist_name: str, song_title: str) -> Optional[str]:
+    """Get the album name for a track from MusicBrainz."""
+    try:
+        # Search for the recording
+        result = musicbrainzngs.search_recordings(query=f'artist:"{artist_name}" AND recording:"{song_title}"', limit=1)
+        recordings = result.get('recording-list', [])
+        
+        if not recordings:
+            return None
+        
+        recording = recordings[0]
+        releases = recording.get('release-list', [])
+        
+        if not releases:
+            return None
+        
+        # Take the first release
+        release = releases[0]
+        album_title = release.get('title')
+        
+        if album_title:
+            return album_title.strip()
+        
+        return None
+
+    except Exception as e:
+        print(f"      ⚠️ MusicBrainz album lookup error: {e}")
+        return None
+
+
+def get_album_from_deepseek(artist_name: str, song_title: str) -> Optional[str]:
+    """Get the album name for a track from DeepSeek API (last resort)."""
+    if not DEEPSEEK_API_KEY:
+        return None
+
+    try:
+        prompt = f"""You are a music expert. What is the album name for the song "{song_title}" by {artist_name}?
+
+IMPORTANT: Respond ONLY with the album name. Do not add any other text or explanation.
+If you don't know, respond with 'NONE'."""
+
+        headers = {
+            'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+
+        data = {
+            'model': 'deepseek-chat',
+            'messages': [
+                {'role': 'system', 'content': 'You are a music expert. Respond ONLY with the album name or "NONE".'},
+                {'role': 'user', 'content': prompt}
+            ],
+            'temperature': 0.1,
+            'max_tokens': 50
+        }
+
+        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=10)
+        resp.raise_for_status()
+
+        result = resp.json()
+        album_name = result['choices'][0]['message']['content'].strip()
+
+        if album_name and album_name != 'NONE':
+            return album_name
+
+        return None
+
+    except Exception as e:
+        print(f"      ⚠️ DeepSeek album lookup error: {e}")
+        return None
+
+
+def find_album_in_db(album_map: Dict[int, Dict[str, int]], id_artist: int, album_name: str) -> int:
+    """
+    Search for album in album_map with fuzzy matching (case-insensitive, trim).
+    Returns id_album if found, else 0.
+    """
+    if not album_name:
+        return 0
+    
+    if id_artist not in album_map:
+        return 0
+    
+    album_name_clean = album_name.strip()
+    album_name_lower = album_name_clean.lower()
+    
+    # Exact match (case-insensitive)
+    for title, id_album in album_map[id_artist].items():
+        if title.lower() == album_name_lower:
+            return id_album
+    
+    # Partial match (if album name contains the search term)
+    for title, id_album in album_map[id_artist].items():
+        if album_name_lower in title.lower() or title.lower() in album_name_lower:
+            return id_album
+    
+    return 0
+
+
+def find_album_for_song(artist_name: str, song_title: str, album_from_scrobble: str,
+                         album_map: Dict[int, Dict[str, int]], id_artist: int) -> Tuple[int, str]:
+    """
+    Find album ID for a song.
+    Returns (id_album, source).
+    Sources: 'scrobble', 'lastfm', 'musicbrainz', 'deepseek', 'none'
+    """
+    # 1. Try from scrobble data
+    if album_from_scrobble:
+        id_album = find_album_in_db(album_map, id_artist, album_from_scrobble)
+        if id_album > 0:
+            return id_album, 'scrobble'
+    
+    # 2. Try Last.fm track.getInfo
+    album_name = get_album_from_lastfm_track(artist_name, song_title)
+    if album_name:
+        id_album = find_album_in_db(album_map, id_artist, album_name)
+        if id_album > 0:
+            return id_album, 'lastfm'
+    
+    # 3. Try MusicBrainz
+    album_name = get_album_from_musicbrainz(artist_name, song_title)
+    if album_name:
+        id_album = find_album_in_db(album_map, id_artist, album_name)
+        if id_album > 0:
+            return id_album, 'musicbrainz'
+    
+    # 4. Try DeepSeek (last resort)
+    album_name = get_album_from_deepseek(artist_name, song_title)
+    if album_name:
+        id_album = find_album_in_db(album_map, id_artist, album_name)
+        if id_album > 0:
+            return id_album, 'deepseek'
+    
+    return 0, 'none'
 
 
 # ============================================
@@ -223,11 +413,13 @@ def create_schema(conn):
         CREATE TABLE IF NOT EXISTS Song (
             id_song     INTEGER PRIMARY KEY AUTOINCREMENT,
             id_artist   INTEGER NOT NULL,
-            id_album    INTEGER NOT NULL,
+            id_album    INTEGER NOT NULL DEFAULT 0,
             title       TEXT    NOT NULL,
             duration    INTEGER,
-            duration_source TEXT, -- 'lastfm', 'spotify', 'deepseek', 'pending', 'unknown'
+            duration_source TEXT,
             retry_count INTEGER DEFAULT 0,
+            album_retry_count INTEGER DEFAULT 0,
+            album_source TEXT,
             last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (id_artist, title)
         )
@@ -248,12 +440,21 @@ def create_schema(conn):
     if 'retry_count' not in columns:
         cursor.execute("ALTER TABLE Song ADD COLUMN retry_count INTEGER DEFAULT 0")
         print("   ✅ Added column: retry_count")
+    
+    if 'album_retry_count' not in columns:
+        cursor.execute("ALTER TABLE Song ADD COLUMN album_retry_count INTEGER DEFAULT 0")
+        print("   ✅ Added column: album_retry_count")
+    
+    if 'album_source' not in columns:
+        cursor.execute("ALTER TABLE Song ADD COLUMN album_source TEXT")
+        print("   ✅ Added column: album_source")
 
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_artist ON Song (id_artist)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_album ON Song (id_album)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_title ON Song (title)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_duration ON Song (duration)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_retry ON Song (retry_count)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_song_album_retry ON Song (album_retry_count)')
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Metadata (
@@ -312,13 +513,6 @@ def load_album_map() -> Dict[int, Dict[str, int]]:
     return album_map
 
 
-def get_album_id_from_title(album_map: Dict[int, Dict[str, int]], id_artist: int, album_title: str) -> int:
-    """Get album ID from album map using id_artist, return 0 if not found."""
-    if id_artist in album_map and album_title in album_map[id_artist]:
-        return album_map[id_artist][album_title]
-    return 0
-
-
 def song_exists(conn, id_artist: int, title: str) -> bool:
     cursor = conn.cursor()
     cursor.execute('SELECT id_song FROM Song WHERE id_artist = ? AND title = ?', (id_artist, title))
@@ -336,17 +530,31 @@ def get_pending_songs(conn) -> list:
     return cursor.fetchall()
 
 
+def get_songs_without_album(conn) -> list:
+    """Get songs that have id_album = 0 and album_retry_count < 3."""
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id_song, id_artist, title, album_retry_count
+        FROM Song
+        WHERE id_album = 0 AND album_retry_count < 3
+        ORDER BY album_retry_count ASC, last_update ASC
+    ''')
+    return cursor.fetchall()
+
+
 def save_song(conn, id_artist: int, id_album: int, title: str, 
-              duration: Optional[int] = None, source: str = 'unknown', retry_count: int = 0):
+              duration: Optional[int] = None, duration_source: str = 'unknown',
+              retry_count: int = 0, album_retry_count: int = 0,
+              album_source: str = None):
     cursor = conn.cursor()
 
     if song_exists(conn, id_artist, title):
         return None
 
     cursor.execute('''
-        INSERT INTO Song (id_artist, id_album, title, duration, duration_source, retry_count, last_update)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (id_artist, id_album, title, duration, source, retry_count))
+        INSERT INTO Song (id_artist, id_album, title, duration, duration_source, retry_count, album_retry_count, album_source, last_update)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (id_artist, id_album, title, duration, duration_source, retry_count, album_retry_count, album_source))
     conn.commit()
 
     return cursor.lastrowid
@@ -359,6 +567,16 @@ def update_song_duration(conn, id_song: int, duration: Optional[int], source: st
         SET duration = ?, duration_source = ?, retry_count = retry_count + 1, last_update = CURRENT_TIMESTAMP
         WHERE id_song = ?
     ''', (duration, source, id_song))
+    conn.commit()
+
+
+def update_song_album(conn, id_song: int, id_album: int, album_source: str):
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE Song
+        SET id_album = ?, album_source = ?, album_retry_count = album_retry_count + 1, last_update = CURRENT_TIMESTAMP
+        WHERE id_song = ?
+    ''', (id_album, album_source, id_song))
     conn.commit()
 
 
@@ -448,7 +666,7 @@ def process_scrobble(conn, scrobble_data, artist_map: dict, album_map: dict,
     song_title = scrobble_data['name']
     
     # Get album name from scrobble data (if available)
-    album_title = scrobble_data.get('album', {}).get('#text', '')
+    album_from_scrobble = scrobble_data.get('album', {}).get('#text', '')
 
     id_artist = artist_map.get(artist_name)
 
@@ -474,76 +692,132 @@ def process_scrobble(conn, scrobble_data, artist_map: dict, album_map: dict,
     if song_exists(conn, id_artist, song_title):
         return
 
-    # Get album ID using id_artist
-    id_album = 0
-    if album_title:
-        id_album = get_album_id_from_title(album_map, id_artist, album_title)
-        # If not found, try with matched artist name? No, we need id_artist.
-        # If album still 0, it's fine.
+    # Try to find album
+    id_album, album_source = find_album_for_song(
+        artist_name, song_title, album_from_scrobble, album_map, id_artist
+    )
+    
+    # If album not found, set to 0 and mark for retry
+    album_retry_count = 0
+    if id_album == 0:
+        album_retry_count = 0  # Will increment on retry
+        album_source = 'none'
 
     print(f"    🎵 New song: {song_title}")
     if id_album > 0:
-        print(f"      💿 Album ID: {id_album}")
+        print(f"      💿 Album ID: {id_album} (source: {album_source})")
     else:
-        print(f"      💿 No album match found")
+        print(f"      💿 No album found (will retry later)")
 
-    duration, source = fetch_duration_with_fallback(artist_name, song_title)
+    # Get duration
+    duration, duration_source = fetch_duration_with_fallback(artist_name, song_title)
 
     if duration:
         minutes = duration // 60
         seconds = duration % 60
-        print(f"      ⏱️ Duration: {minutes}:{seconds:02d} ({duration}s) [source: {source}]")
+        print(f"      ⏱️ Duration: {minutes}:{seconds:02d} ({duration}s) [source: {duration_source}]")
     else:
         print(f"      ⏱️ Duration: Unknown [source: pending] - Will retry on next run")
 
-    retry_count = 0 if source != 'pending' else 0
-    save_song(conn, id_artist, id_album, song_title, duration, source, retry_count)
+    retry_count = 0 if duration_source != 'pending' else 0
+    save_song(conn, id_artist, id_album, song_title, duration, duration_source,
+              retry_count, album_retry_count, album_source)
 
-    if source in ('spotify', 'deepseek', 'pending'):
+    # Rate limiting
+    if duration_source in ('spotify', 'deepseek', 'pending'):
         time.sleep(0.5)
+    if album_source in ('lastfm', 'musicbrainz', 'deepseek'):
+        time.sleep(0.3)
 
 
 def retry_pending_songs(conn, artist_map: dict, album_map: dict, artist_name_cache: dict):
+    """Retry songs that have pending duration."""
     pending = get_pending_songs(conn)
     
     if not pending:
-        print("   No pending songs to retry.")
+        print("   No pending songs to retry (duration).")
+    else:
+        print(f"   🔄 Retrying {len(pending)} pending duration songs...")
+        
+        id_to_name = {id_artist: name for name, id_artist in artist_map.items()}
+        
+        retried = 0
+        for id_song, id_artist, title, retry_count in pending:
+            artist_name = id_to_name.get(id_artist)
+            if not artist_name:
+                continue
+            
+            print(f"      🔄 Retry {retry_count + 1}: {artist_name} - {title}")
+            
+            duration, source = fetch_duration_with_fallback(artist_name, title)
+            
+            if duration:
+                minutes = duration // 60
+                seconds = duration % 60
+                print(f"         ✅ Found! {minutes}:{seconds:02d} ({duration}s) [source: {source}]")
+                update_song_duration(conn, id_song, duration, source)
+                retried += 1
+            else:
+                print(f"         ⏳ Still pending...")
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE Song
+                    SET retry_count = retry_count + 1, last_update = CURRENT_TIMESTAMP
+                    WHERE id_song = ?
+                ''', (id_song,))
+                conn.commit()
+            
+            if source in ('spotify', 'deepseek', 'pending'):
+                time.sleep(0.5)
+        
+        if retried > 0:
+            print(f"   ✅ Found durations for {retried} pending songs!")
+
+
+def retry_album_songs(conn, artist_map: dict, album_map: dict, artist_name_cache: dict):
+    """Retry songs that have id_album = 0."""
+    songs = get_songs_without_album(conn)
+    
+    if not songs:
+        print("   No songs without album to retry.")
         return 0
     
-    print(f"   🔄 Retrying {len(pending)} pending songs...")
+    print(f"   🔄 Retrying {len(songs)} songs without album...")
     
-    # Build reverse map: id_artist -> name
     id_to_name = {id_artist: name for name, id_artist in artist_map.items()}
     
     retried = 0
-    for id_song, id_artist, title, retry_count in pending:
+    for id_song, id_artist, title, album_retry_count in songs:
         artist_name = id_to_name.get(id_artist)
-        
         if not artist_name:
             continue
         
-        print(f"      🔄 Retry {retry_count + 1}: {artist_name} - {title}")
+        print(f"      🔄 Album retry {album_retry_count + 1}: {artist_name} - {title}")
         
-        duration, source = fetch_duration_with_fallback(artist_name, title)
+        # Try to find album again (without album_from_scrobble, since we don't have it)
+        id_album, album_source = find_album_for_song(
+            artist_name, title, '', album_map, id_artist
+        )
         
-        if duration:
-            minutes = duration // 60
-            seconds = duration % 60
-            print(f"         ✅ Found! {minutes}:{seconds:02d} ({duration}s) [source: {source}]")
-            update_song_duration(conn, id_song, duration, source)
+        if id_album > 0:
+            print(f"         ✅ Found album! ID: {id_album} (source: {album_source})")
+            update_song_album(conn, id_song, id_album, album_source)
             retried += 1
         else:
-            print(f"         ⏳ Still pending...")
+            print(f"         ⏳ Still no album found.")
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE Song
-                SET retry_count = retry_count + 1, last_update = CURRENT_TIMESTAMP
+                SET album_retry_count = album_retry_count + 1, last_update = CURRENT_TIMESTAMP
                 WHERE id_song = ?
             ''', (id_song,))
             conn.commit()
         
-        if source in ('spotify', 'deepseek', 'pending'):
-            time.sleep(0.5)
+        if album_source in ('lastfm', 'musicbrainz', 'deepseek'):
+            time.sleep(0.3)
+    
+    if retried > 0:
+        print(f"   ✅ Found albums for {retried} songs!")
     
     return retried
 
@@ -603,10 +877,11 @@ def fetch_all_scrobbles(conn, limit: int = 200):
         page += 1
         time.sleep(0.3)
 
-    print("\n🔄 Retrying pending songs...")
-    retried = retry_pending_songs(conn, artist_map, album_map, artist_name_cache)
-    if retried > 0:
-        print(f"   ✅ Found durations for {retried} pending songs!")
+    print("\n🔄 Retrying pending duration songs...")
+    retry_pending_songs(conn, artist_map, album_map, artist_name_cache)
+
+    print("\n🔄 Retrying songs without album...")
+    retry_album_songs(conn, artist_map, album_map, artist_name_cache)
 
     now = datetime.now().isoformat()
     set_last_update_time(conn, now)
@@ -626,8 +901,14 @@ def get_stats(conn):
     cursor.execute('SELECT COUNT(*) FROM Song WHERE duration_source = ?', ('pending',))
     pending_songs = cursor.fetchone()[0]
 
+    cursor.execute('SELECT COUNT(*) FROM Song WHERE id_album = 0')
+    songs_without_album = cursor.fetchone()[0]
+
     cursor.execute('SELECT duration_source, COUNT(*) FROM Song WHERE duration IS NOT NULL GROUP BY duration_source')
     duration_sources = cursor.fetchall()
+
+    cursor.execute('SELECT album_source, COUNT(*) FROM Song WHERE id_album > 0 GROUP BY album_source')
+    album_sources = cursor.fetchall()
 
     cursor.execute('SELECT SUM(duration) FROM Song')
     total_duration = cursor.fetchone()[0]
@@ -636,14 +917,12 @@ def get_stats(conn):
         'total_songs': total_songs,
         'songs_with_duration': songs_with_duration,
         'pending_songs': pending_songs,
+        'songs_without_album': songs_without_album,
         'duration_sources': duration_sources,
+        'album_sources': album_sources,
         'total_duration_seconds': total_duration
     }
 
-
-# ============================================
-# MAIN FUNCTION
-# ============================================
 
 def create_database():
     print("=" * 60)
@@ -697,10 +976,16 @@ def create_database():
     print(f"🎵 Total songs: {stats['total_songs']}")
     print(f"⏱️  Songs with duration: {stats['songs_with_duration']}")
     print(f"⏳ Pending songs (no duration yet): {stats['pending_songs']}")
+    print(f"💿 Songs without album: {stats['songs_without_album']}")
 
     if stats['duration_sources']:
         print("\n📊 Duration sources:")
         for source, count in stats['duration_sources']:
+            print(f"   {source}: {count} songs")
+
+    if stats['album_sources']:
+        print("\n📊 Album sources:")
+        for source, count in stats['album_sources']:
             print(f"   {source}: {count} songs")
 
     if stats['total_duration_seconds']:

@@ -13,7 +13,7 @@ It retrieves:
 BEHAVIOR:
 - For each artist in 1_artist_genres.db, fetch their releases from MusicBrainz.
 - Insert new albums into 2_albums_raw.db.
-- If an album already exists (by id_artist + title), skip or update missing fields (like cover_url).
+- If an album already exists (by id_artist + title + release_year), skip it.
 - id_album is autoincrement, id_artist is the same as in Artist table.
 """
 
@@ -89,7 +89,8 @@ def get_cover_from_lastfm(artist_name: str, album_title: str) -> Optional[str]:
         for img in images:
             if img.get('size') == 'extralarge':
                 url = img.get('#text')
-                if url and not url.endswith('2a96fbd4b0e3e8c4.png'):  # Generic placeholder
+                # Skip generic placeholder images
+                if url and not url.endswith('2a96fbd4b0e3e8c4.png'):
                     return url
 
         return None
@@ -196,33 +197,57 @@ def get_album_cover(artist_name: str, album_title: str) -> tuple:
 # ============================================
 
 def create_schema(conn):
-    """Creates the Album table if it doesn't exist."""
+    """Creates the Album table and handles schema migrations."""
     cursor = conn.cursor()
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS Album (
-            id_album     INTEGER PRIMARY KEY AUTOINCREMENT,
-            id_artist    INTEGER NOT NULL,
-            title        TEXT    NOT NULL,
-            release_year INTEGER,
-            release_date TEXT,
-            album_type   TEXT,
-            total_tracks INTEGER,
-            label        TEXT,
-            producer     TEXT,
-            cover_url    TEXT,
-            cover_source TEXT,
-            last_update  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (id_artist, title, release_year)
-        )
-    ''')
+    # Check if table exists
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Album'")
+    table_exists = cursor.fetchone() is not None
+
+    if not table_exists:
+        # Create full table
+        cursor.execute('''
+            CREATE TABLE Album (
+                id_album     INTEGER PRIMARY KEY AUTOINCREMENT,
+                id_artist    INTEGER NOT NULL,
+                title        TEXT    NOT NULL,
+                release_year INTEGER,
+                release_date TEXT,
+                album_type   TEXT,
+                total_tracks INTEGER,
+                label        TEXT,
+                producer     TEXT,
+                cover_url    TEXT,
+                cover_source TEXT,
+                last_update  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (id_artist, title, release_year)
+            )
+        ''')
+        print("✅ Created table Album with cover_source")
+    else:
+        # Table exists: add missing columns
+        cursor.execute("PRAGMA table_info(Album)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+
+        if 'cover_source' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN cover_source TEXT')
+            print("✅ Added column: cover_source")
+
+        # Ensure other columns exist (optional)
+        if 'cover_url' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN cover_url TEXT')
+            print("✅ Added column: cover_url")
+
+        if 'producer' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN producer TEXT')
+            print("✅ Added column: producer")
 
     # Indexes
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_artist ON Album (id_artist)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_title ON Album (title)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_release_year ON Album (release_year)')
 
-    # Table to track last update time
+    # Metadata table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Metadata (
             key     TEXT PRIMARY KEY,
@@ -385,19 +410,18 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
 def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
     """Fetch and save albums for a single artist."""
     new_albums = 0
-    updated_covers = 0
 
     # 1. Get artist MBID from MusicBrainz
     mbid = search_artist_mbid(artist_name)
     if not mbid:
         print(f"   ⚠️ No MusicBrainz ID found for '{artist_name}'")
-        return 0, 0
+        return 0
 
     # 2. Get releases
     releases = get_artist_releases(mbid)
     if not releases:
         print(f"   ⚠️ No releases found for '{artist_name}'")
-        return 0, 0
+        return 0
 
     print(f"   📀 Found {len(releases)} releases")
 
@@ -407,7 +431,7 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
 
         parsed = parse_release(release)
 
-        # Check if album already exists
+        # Skip if album already exists
         if album_exists(album_conn, artist_id, parsed['title'], parsed['release_year']):
             continue
 
@@ -438,7 +462,7 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
         # Avoid rate limiting
         time.sleep(0.2)
 
-    return new_albums, updated_covers
+    return new_albums
 
 
 def create_album_database():
@@ -482,7 +506,6 @@ def create_album_database():
     print("-" * 60)
 
     total_new = 0
-    total_updated_covers = 0
 
     for idx, artist in enumerate(artists, start=1):
         artist_id = artist['id']
@@ -490,9 +513,8 @@ def create_album_database():
 
         print(f"\n[{idx}/{len(artists)}] {artist_name} (ID: {artist_id})")
 
-        new, covers = fetch_albums_for_artist(artist_id, artist_name, album_conn)
+        new = fetch_albums_for_artist(artist_id, artist_name, album_conn)
         total_new += new
-        total_updated_covers += covers
 
         # Avoid rate limiting
         time.sleep(0.5)
@@ -512,7 +534,6 @@ def create_album_database():
     print(f"📋 Table 'Album' with album details")
     print(f"🎵 Total albums in DB: {total_albums}")
     print(f"   New albums added: {total_new}")
-    print(f"   Covers updated: {total_updated_covers}")
     print("=" * 60)
 
     album_conn.close()

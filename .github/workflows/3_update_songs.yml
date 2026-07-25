@@ -2,11 +2,12 @@ name: 3. Update Songs from Last.fm
 
 on:
   schedule:
-    - cron: '30 5 * * *'  # 5:30 AM UTC (after artists update)
-  workflow_dispatch:
+    # Run daily at 6:15 AM UTC (after albums update)
+    - cron: '15 6 * * *'
+  workflow_dispatch:  # Allow manual trigger
 
 permissions:
-  contents: write
+  contents: write  # Needed to commit/push the updated database
 
 jobs:
   update-songs:
@@ -36,19 +37,20 @@ jobs:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-        run: python script/2_song_db_raw.py
-
-      - name: 💾 Commit and push song database
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add data/2_songs_raw.db
-          git diff --staged --quiet || git commit -m "Actualizar 2_songs_raw.db con canciones [skip ci]"
-          git push
+          python script/3_song_db_raw.py
 
       - name: 📤 Upload song database as artifact
         uses: actions/upload-artifact@v4
         with:
           name: songs-database-raw
-          path: data/2_songs_raw.db
+          path: data/3_songs_raw.db
           retention-days: 7
+
+      - name: 💾 Commit and push database
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/3_songs_raw.db
+          git diff --staged --quiet || git commit -m "Actualizar 3_songs_raw.db con canciones de Last.fm [skip ci]"
+          git push

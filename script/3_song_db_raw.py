@@ -292,33 +292,30 @@ def load_artist_map() -> dict:
     return mapping
 
 
-def load_album_map() -> Dict[str, Dict[str, int]]:
+def load_album_map() -> Dict[int, Dict[str, int]]:
     """
     Loads all albums into memory as a nested dict:
-    {artist_name: {album_title: id_album}}
+    {id_artist: {album_title: id_album}}
+    (No JOIN with Artist to avoid cross-database issues.)
     """
     album_conn = sqlite3.connect(ALBUM_DB_PATH)
     cursor = album_conn.cursor()
-    cursor.execute('''
-        SELECT a.name, al.title, al.id_album
-        FROM Album al
-        JOIN Artist a ON al.id_artist = a.id_artist
-    ''')
+    cursor.execute('SELECT id_artist, title, id_album FROM Album')
     
     album_map = {}
-    for artist_name, album_title, id_album in cursor.fetchall():
-        if artist_name not in album_map:
-            album_map[artist_name] = {}
-        album_map[artist_name][album_title] = id_album
+    for id_artist, album_title, id_album in cursor.fetchall():
+        if id_artist not in album_map:
+            album_map[id_artist] = {}
+        album_map[id_artist][album_title] = id_album
     
     album_conn.close()
     return album_map
 
 
-def get_album_id_from_title(album_map: Dict, artist_name: str, album_title: str) -> int:
-    """Get album ID from album map, return 0 if not found."""
-    if artist_name in album_map and album_title in album_map[artist_name]:
-        return album_map[artist_name][album_title]
+def get_album_id_from_title(album_map: Dict[int, Dict[str, int]], id_artist: int, album_title: str) -> int:
+    """Get album ID from album map using id_artist, return 0 if not found."""
+    if id_artist in album_map and album_title in album_map[id_artist]:
+        return album_map[id_artist][album_title]
     return 0
 
 
@@ -477,15 +474,12 @@ def process_scrobble(conn, scrobble_data, artist_map: dict, album_map: dict,
     if song_exists(conn, id_artist, song_title):
         return
 
-    # Get album ID
+    # Get album ID using id_artist
     id_album = 0
     if album_title:
-        id_album = get_album_id_from_title(album_map, artist_name, album_title)
-        if id_album == 0:
-            # Try with matched artist name
-            matched_name = artist_name_cache.get(artist_name)
-            if matched_name:
-                id_album = get_album_id_from_title(album_map, matched_name, album_title)
+        id_album = get_album_id_from_title(album_map, id_artist, album_title)
+        # If not found, try with matched artist name? No, we need id_artist.
+        # If album still 0, it's fine.
 
     print(f"    🎵 New song: {song_title}")
     if id_album > 0:
@@ -518,16 +512,12 @@ def retry_pending_songs(conn, artist_map: dict, album_map: dict, artist_name_cac
     
     print(f"   🔄 Retrying {len(pending)} pending songs...")
     
+    # Build reverse map: id_artist -> name
     id_to_name = {id_artist: name for name, id_artist in artist_map.items()}
     
     retried = 0
     for id_song, id_artist, title, retry_count in pending:
-        # Get artist name (try cache first)
-        artist_name = None
-        for name, aid in artist_map.items():
-            if aid == id_artist:
-                artist_name = name
-                break
+        artist_name = id_to_name.get(id_artist)
         
         if not artist_name:
             continue

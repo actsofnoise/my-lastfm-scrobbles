@@ -8,7 +8,7 @@ It retrieves:
 - Album type (studio, live, compilation, etc.)
 - Total tracks
 - Label (record label)
-- Cover URL (from Cover Art Archive)
+- Cover URL (from: Last.fm → Deezer → DeepSeek)
 
 BEHAVIOR:
 - For each artist in 1_artist_genres.db, fetch their releases from MusicBrainz.
@@ -27,7 +27,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
-# Try to import musicbrainzngs, install if missing
+# Try to import musicbrainzngs
 try:
     import musicbrainzngs
 except ImportError:
@@ -42,12 +42,153 @@ load_dotenv()
 ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '1_artist_genres.db')
 ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_albums_raw.db')
 
+# --- Credentials ---
+LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
+
+LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
+DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions'
+DEEZER_API_URL = 'https://api.deezer.com/search/album'
+
 # Configure MusicBrainz
 musicbrainzngs.set_useragent(
     "my_scrobbles",
     "1.0",
     "https://github.com/adroguett-scratch/my-lastfm-scrobbles"
 )
+
+
+# ============================================
+# COVER FETCHING FUNCTIONS
+# ============================================
+
+def get_cover_from_lastfm(artist_name: str, album_title: str) -> Optional[str]:
+    """Get album cover from Last.fm API."""
+    if not LASTFM_API_KEY:
+        return None
+
+    try:
+        params = {
+            'method': 'album.getinfo',
+            'artist': artist_name,
+            'album': album_title,
+            'api_key': LASTFM_API_KEY,
+            'format': 'json'
+        }
+
+        resp = requests.get(LASTFM_API_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if 'error' in data:
+            return None
+
+        album = data.get('album', {})
+        images = album.get('image', [])
+
+        for img in images:
+            if img.get('size') == 'extralarge':
+                url = img.get('#text')
+                if url and not url.endswith('2a96fbd4b0e3e8c4.png'):  # Generic placeholder
+                    return url
+
+        return None
+
+    except Exception as e:
+        print(f"      ⚠️ Last.fm cover error: {e}")
+        return None
+
+
+def get_cover_from_deezer(artist_name: str, album_title: str) -> Optional[str]:
+    """Get album cover from Deezer API (no auth required)."""
+    try:
+        params = {'q': f'artist:"{artist_name}" album:"{album_title}"', 'limit': 1}
+        resp = requests.get(DEEZER_API_URL, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        albums = data.get('data', [])
+        if albums:
+            cover = albums[0].get('cover_big')
+            if cover:
+                return cover
+
+        return None
+
+    except Exception as e:
+        print(f"      ⚠️ Deezer cover error: {e}")
+        return None
+
+
+def get_cover_from_deepseek(artist_name: str, album_title: str) -> Optional[str]:
+    """Get album cover from DeepSeek API (last resort)."""
+    if not DEEPSEEK_API_KEY:
+        return None
+
+    try:
+        prompt = f"""You are a music assistant. Find the official album cover URL for the album '{album_title}' by {artist_name}.
+
+IMPORTANT:
+- Respond ONLY with the image URL.
+- Do not add any other text or explanation.
+- If you can't find a valid cover URL, respond with 'NONE'."""
+
+        headers = {
+            'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+
+        data = {
+            'model': 'deepseek-chat',
+            'messages': [
+                {'role': 'system', 'content': 'You are a music assistant. Respond ONLY with a valid image URL or "NONE".'},
+                {'role': 'user', 'content': prompt}
+            ],
+            'temperature': 0.1,
+            'max_tokens': 150
+        }
+
+        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=15)
+        resp.raise_for_status()
+
+        result = resp.json()
+        cover_url = result['choices'][0]['message']['content'].strip()
+
+        if cover_url and cover_url != 'NONE' and cover_url.startswith('http'):
+            return cover_url
+
+        return None
+
+    except Exception as e:
+        print(f"      ⚠️ DeepSeek cover error: {e}")
+        return None
+
+
+def get_album_cover(artist_name: str, album_title: str) -> tuple:
+    """
+    Get album cover using multiple sources in order:
+    1. Last.fm
+    2. Deezer
+    3. DeepSeek (last resort)
+
+    Returns (cover_url, source)
+    """
+    # 1. Try Last.fm
+    cover = get_cover_from_lastfm(artist_name, album_title)
+    if cover:
+        return cover, 'lastfm'
+
+    # 2. Try Deezer
+    cover = get_cover_from_deezer(artist_name, album_title)
+    if cover:
+        return cover, 'deezer'
+
+    # 3. Try DeepSeek (last resort)
+    cover = get_cover_from_deepseek(artist_name, album_title)
+    if cover:
+        return cover, 'deepseek'
+
+    return None, None
 
 
 # ============================================
@@ -70,6 +211,7 @@ def create_schema(conn):
             label        TEXT,
             producer     TEXT,
             cover_url    TEXT,
+            cover_source TEXT,
             last_update  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE (id_artist, title, release_year)
         )
@@ -80,7 +222,7 @@ def create_schema(conn):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_title ON Album (title)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_release_year ON Album (release_year)')
 
-    # Table to track last update time (optional)
+    # Table to track last update time
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS Metadata (
             key     TEXT PRIMARY KEY,
@@ -116,31 +258,21 @@ def album_exists(conn, id_artist: int, title: str, release_year: int = None) -> 
     return cursor.fetchone() is not None
 
 
-def save_album(conn, id_artist: int, title: str, release_year: int = None,
+def save_album(conn, artist_id: int, title: str, release_year: int = None,
                release_date: str = None, album_type: str = None,
                total_tracks: int = None, label: str = None,
-               producer: str = None, cover_url: str = None):
+               producer: str = None, cover_url: str = None,
+               cover_source: str = None):
     """Insert a new album into the database."""
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR IGNORE INTO Album (
             id_artist, title, release_year, release_date, album_type,
-            total_tracks, label, producer, cover_url, last_update
+            total_tracks, label, producer, cover_url, cover_source, last_update
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (id_artist, title, release_year, release_date, album_type,
-          total_tracks, label, producer, cover_url))
-    conn.commit()
-
-
-def update_album_cover(conn, id_artist: int, title: str, cover_url: str):
-    """Update cover_url for an existing album (if missing)."""
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE Album
-        SET cover_url = ?, last_update = CURRENT_TIMESTAMP
-        WHERE id_artist = ? AND title = ? AND (cover_url IS NULL OR cover_url = '')
-    ''', (cover_url, id_artist, title))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (artist_id, title, release_year, release_date, album_type,
+          total_tracks, label, producer, cover_url, cover_source))
     conn.commit()
 
 
@@ -180,10 +312,7 @@ def search_artist_mbid(artist_name: str) -> Optional[str]:
 
 
 def get_artist_releases(artist_mbid: str) -> List[Dict[str, Any]]:
-    """
-    Get all releases (albums) for an artist from MusicBrainz.
-    Uses browse_releases (correct method).
-    """
+    """Get all releases (albums) for an artist from MusicBrainz."""
     try:
         result = musicbrainzngs.browse_releases(
             artist=artist_mbid,
@@ -198,9 +327,7 @@ def get_artist_releases(artist_mbid: str) -> List[Dict[str, Any]]:
 
 
 def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Parse a MusicBrainz release dict into our format.
-    """
+    """Parse a MusicBrainz release dict into our format."""
     title = release.get('title', '')
 
     # Release date
@@ -219,7 +346,7 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
         except:
             pass
 
-    # Album type (from release group)
+    # Album type
     release_group = release.get('release-group', {})
     primary_type = release_group.get('primary-type', '')
     secondary_types = release_group.get('secondary-types', [])
@@ -233,7 +360,7 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
     if label_info:
         label = label_info[0].get('label', {}).get('name', '')
 
-    # Total tracks (from medium-list)
+    # Total tracks
     medium_list = release.get('medium-list', [])
     total_tracks = 0
     for medium in medium_list:
@@ -251,29 +378,12 @@ def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def get_cover_url(release_mbid: str) -> Optional[str]:
-    """
-    Get the cover URL from Cover Art Archive.
-    """
-    try:
-        url = f"https://coverartarchive.org/release/{release_mbid}/front-500"
-        resp = requests.head(url, timeout=5)
-        if resp.status_code == 200:
-            return url
-        return None
-    except Exception:
-        return None
-
-
 # ============================================
 # MAIN PROCESSING FUNCTION
 # ============================================
 
 def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
-    """
-    Fetch and save albums for a single artist.
-    Returns (new_albums, updated_covers).
-    """
+    """Fetch and save albums for a single artist."""
     new_albums = 0
     updated_covers = 0
 
@@ -301,11 +411,13 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
         if album_exists(album_conn, artist_id, parsed['title'], parsed['release_year']):
             continue
 
-        # Get cover URL
-        release_mbid = release.get('id')
-        cover_url = None
-        if release_mbid:
-            cover_url = get_cover_url(release_mbid)
+        # Get cover URL with fallbacks
+        cover_url, cover_source = get_album_cover(artist_name, parsed['title'])
+
+        if cover_url:
+            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [cover: {cover_source}]")
+        else:
+            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [no cover]")
 
         # Save album
         save_album(
@@ -318,7 +430,8 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
             total_tracks=parsed['total_tracks'],
             label=parsed['label'],
             producer=parsed['producer'],
-            cover_url=cover_url
+            cover_url=cover_url,
+            cover_source=cover_source
         )
         new_albums += 1
 

@@ -2,11 +2,12 @@ name: 2. Update Albums from MusicBrainz
 
 on:
   schedule:
-    - cron: '45 5 * * *'
-  workflow_dispatch:
+    # Run daily at 5:15 AM UTC (after artist genre filter)
+    - cron: '15 5 * * *'
+  workflow_dispatch:  # Allow manual trigger
 
 permissions:
-  contents: write
+  contents: write  # Needed to commit/push the updated database
 
 jobs:
   update-albums:
@@ -30,6 +31,9 @@ jobs:
         run: mkdir -p data
 
       - name: 🎵 Run album database update
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           python script/2_album_db_raw.py
 

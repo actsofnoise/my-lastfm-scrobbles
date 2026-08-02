@@ -20,7 +20,9 @@ Duration is fetched from:
 3. NVIDIA-hosted DeepSeek V4 Flash (fallback 2 - AI)
 
 Album is fetched from:
-1. NVIDIA-hosted DeepSeek V4 Flash (primary - identifies the ORIGINAL release)
+1. NVIDIA-hosted DeepSeek V4 Flash (primary - identifies the ORIGINAL release,
+   checking Album -> EP -> Single -> Greatest Hits -> Live, one type at a
+   time, stopping at the first match, to force this exact priority order)
 2. Scrobble data (fallback, if available)
 3. Last.fm track.getInfo (fallback)
 4. MusicBrainz (fallback)
@@ -101,7 +103,13 @@ spotify_token_expires = 0
 album_ai_cache: Dict[str, Optional[dict]] = {}
 
 # Priority order when several album editions match: lower number = higher priority
-ALBUM_TYPE_PRIORITY = {'album': 0, 'lp': 0, 'ep': 1, 'single': 2, 'live': 3}
+ALBUM_TYPE_PRIORITY = {
+    'album': 0, 'lp': 0,
+    'ep': 1,
+    'single': 2,
+    'greatest hits': 3, 'compilation': 3, 'best of': 3,
+    'live': 4
+}
 
 
 # ============================================
@@ -334,20 +342,107 @@ def get_album_from_musicbrainz(artist_name: str, song_title: str) -> Optional[st
         return None
 
 
+# Priority steps, checked one at a time, in strict order. We stop at the
+# first "yes" — this is what actually forces the priority order, instead of
+# hoping the model applies it correctly inside a single combined answer.
+RELEASE_TYPE_STEPS = [
+    ('album', 'a full-length studio album (LP)'),
+    ('ep', 'an EP (not a full studio album)'),
+    ('single', 'a single (not originally released on any studio album or EP)'),
+    ('greatest hits', 'a Greatest Hits / Best Of compilation, ONLY as a song exclusive to '
+                       'or first released on that compilation (not simply included there '
+                       'after already appearing on an earlier album, EP, or single)'),
+    ('live', 'a live album (only if it was never released in studio form at all)'),
+]
+
+
+def _parse_release_check(raw: Optional[str]) -> Optional[dict]:
+    """Parse a {"released": bool, "title": ..., "year": ...} JSON answer."""
+    if not raw:
+        return None
+
+    raw = raw.strip()
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
+
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group())
+    except json.JSONDecodeError:
+        return None
+
+    if not parsed.get('released'):
+        return None
+
+    title = parsed.get('title')
+    if not title or not isinstance(title, str):
+        return None
+
+    year = parsed.get('year')
+    try:
+        year = int(year)
+        current_year = datetime.now().year
+        if not (1900 <= year <= current_year + 1):
+            year = None
+    except (TypeError, ValueError):
+        year = None
+
+    return {'title': title.strip(), 'year': year}
+
+
+def _nvidia_release_check(artist_name: str, song_title: str, description: str) -> Optional[str]:
+    """Ask a single strict yes/no question for one release type. Returns raw content or None."""
+    prompt = f"""Was the song "{song_title}" by {artist_name} originally released on {description}?
+
+Respond ONLY with a JSON object, no markdown, no extra text:
+- If yes: {{"released": true, "title": "<exact release title>", "year": <4-digit release year as integer>}}
+- If no: {{"released": false}}
+
+Be strict — only answer true if this is genuinely the release where the song FIRST appeared."""
+
+    completion = nvidia_client.chat.completions.create(
+        model=NVIDIA_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a music discography expert. Respond ONLY with a valid JSON object, no markdown, no extra text."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=1,
+        top_p=0.95,
+        max_tokens=16384,
+        extra_body={"chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}},
+        stream=False
+    )
+
+    if not completion.choices:
+        return None
+    return completion.choices[0].message.content
+
+
 def get_album_info_from_nvidia(artist_name: str, song_title: str) -> Optional[dict]:
     """
     Ask DeepSeek V4 Flash (via NVIDIA, free tier) for the ORIGINAL release
     where a song first appeared.
 
-    Priority when a song appears on multiple original release types:
+    Instead of asking one combined question and hoping the model respects a
+    priority order in its own reasoning, this checks each release type
+    ONE AT A TIME, in strict order, and stops at the first "yes":
         1. Studio Album (LP)
         2. EP
         3. Single
-        4. Live album (only if it never appeared on any of the above)
+        4. Greatest Hits / Best Of (only if truly exclusive to it)
+        5. Live album (only if never released in studio form at all)
 
-    Reissues, remasters, deluxe/anniversary editions, greatest hits,
-    compilations and box sets are explicitly excluded — we want the
-    earliest original release only.
+    This procedurally forces the priority order — the model never gets a
+    chance to jump straight to "single" or "greatest hits" while skipping
+    over "album", because we simply never ask about those until the album
+    question has already come back negative.
+
+    Most songs resolve on the very first question (they're on a studio
+    album), so this is typically NOT more expensive than a single combined
+    call — it only takes extra calls for the rarer single/live/comp-only
+    tracks.
 
     Returns {'album': str, 'year': int, 'type': str} or None.
     On any failure this returns None quietly — the caller falls back to
@@ -361,92 +456,24 @@ def get_album_info_from_nvidia(artist_name: str, song_title: str) -> Optional[di
     if cache_key in album_ai_cache:
         return album_ai_cache[cache_key]
 
-    try:
-        prompt = f"""You are a music discography expert.
-
-For the song "{song_title}" by {artist_name}, identify the ORIGINAL release where this song first appeared.
-
-Priority order when the song could belong to more than one type of original release:
-1. Studio Album (LP)
-2. EP
-3. Single
-4. Live album (only if it was never released on any studio album, EP or single)
-
-Always choose the EARLIEST original release year for that release.
-Do NOT consider reissues, remasters, deluxe editions, anniversary editions, greatest hits, compilations, or box sets — only the first original release.
-
-Respond ONLY with a JSON object in this exact format, with no extra text, no markdown, no explanation:
-{{"album": "<original album title>", "year": <4-digit year as integer>, "type": "<album|ep|single|live>"}}
-
-If you genuinely don't know, respond with:
-{{"album": null, "year": null, "type": null}}"""
-
-        completion = nvidia_client.chat.completions.create(
-            model=NVIDIA_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a music discography expert. Respond ONLY with a valid JSON object, no markdown, no extra text."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=1,
-            top_p=0.95,
-            max_tokens=16384,
-            extra_body={"chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}},
-            stream=False
-        )
-
-        if not completion.choices:
-            album_ai_cache[cache_key] = None
-            return None
-
-        raw = completion.choices[0].message.content
-        if not raw:
-            album_ai_cache[cache_key] = None
-            return None
-
-        raw = raw.strip()
-        # Strip markdown code fences if the model added them anyway
-        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
-
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if not match:
-            album_ai_cache[cache_key] = None
-            return None
-
-        parsed = json.loads(match.group())
-
-        album = parsed.get('album')
-        year = parsed.get('year')
-        album_type = parsed.get('type')
-
-        if not album or not isinstance(album, str):
-            album_ai_cache[cache_key] = None
-            return None
-
-        # Validate year
+    for album_type, description in RELEASE_TYPE_STEPS:
         try:
-            year = int(year)
-            current_year = datetime.now().year
-            if not (1900 <= year <= current_year + 1):
-                year = None
-        except (TypeError, ValueError):
-            year = None
+            raw = _nvidia_release_check(artist_name, song_title, description)
+        except Exception as e:
+            print(f"      ⚠️ NVIDIA album lookup error ({album_type}) for '{artist_name} - {song_title}': {e}")
+            continue
 
-        # Normalize type
-        if isinstance(album_type, str):
-            album_type = album_type.strip().lower()
-            if album_type not in ALBUM_TYPE_PRIORITY:
-                album_type = None
-        else:
-            album_type = None
+        parsed = _parse_release_check(raw)
+        if parsed:
+            info = {'album': parsed['title'], 'year': parsed['year'], 'type': album_type}
+            album_ai_cache[cache_key] = info
+            return info
 
-        info = {'album': album.strip(), 'year': year, 'type': album_type}
-        album_ai_cache[cache_key] = info
-        return info
+        # Small courtesy delay between sequential steps on the free tier
+        time.sleep(0.3)
 
-    except Exception as e:
-        print(f"      ⚠️ NVIDIA album lookup error for '{artist_name} - {song_title}': {e}")
-        album_ai_cache[cache_key] = None
-        return None
+    album_ai_cache[cache_key] = None
+    return None
 
 
 def _normalize_title(title: str) -> str:

@@ -11,10 +11,12 @@ Duration is fetched from:
 3. DeepSeek API (fallback 2 - AI)
 
 Album is fetched from:
-1. Scrobble data (if available)
-2. Last.fm track.getInfo (fallback)
-3. MusicBrainz (fallback)
-4. DeepSeek (last resort)
+1. DeepSeek (primary - identifies the ORIGINAL release, checking
+   Album -> EP -> Single -> Greatest Hits -> Live, one type at a time,
+   stopping at the first match, to force this exact priority order)
+2. Scrobble data (fallback, if available)
+3. Last.fm track.getInfo (fallback)
+4. MusicBrainz (fallback)
 
 If no album is found, id_album = 0 and album_retry_count is incremented.
 """
@@ -25,6 +27,7 @@ import sys
 import requests
 import time
 import re
+import json
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 from dotenv import load_dotenv
@@ -67,6 +70,18 @@ musicbrainzngs.set_useragent(
 # Spotify token cache
 spotify_token = None
 spotify_token_expires = 0
+
+# Album AI lookup cache (avoid repeated DeepSeek calls for the same song in one run)
+album_ai_cache: Dict[str, Optional[dict]] = {}
+
+# Priority order when several album editions match: lower number = higher priority
+ALBUM_TYPE_PRIORITY = {
+    'album': 0, 'lp': 0,
+    'ep': 1,
+    'single': 2,
+    'greatest hits': 3, 'compilation': 3, 'best of': 3,
+    'live': 4
+}
 
 
 # ============================================
@@ -295,109 +310,235 @@ def get_album_from_musicbrainz(artist_name: str, song_title: str) -> Optional[st
         return None
 
 
-def get_album_from_deepseek(artist_name: str, song_title: str) -> Optional[str]:
-    """Get the album name for a track from DeepSeek API (last resort)."""
-    if not DEEPSEEK_API_KEY:
+# Priority steps, checked one at a time, in strict order. We stop at the
+# first "yes" — this is what actually forces the priority order, instead of
+# hoping the model applies it correctly inside a single combined answer.
+RELEASE_TYPE_STEPS = [
+    ('album', 'a full-length studio album (LP)'),
+    ('ep', 'an EP (not a full studio album)'),
+    ('single', 'a single (not originally released on any studio album or EP)'),
+    ('greatest hits', 'a Greatest Hits / Best Of compilation, ONLY as a song exclusive to '
+                       'or first released on that compilation (not simply included there '
+                       'after already appearing on an earlier album, EP, or single)'),
+    ('live', 'a live album (only if it was never released in studio form at all)'),
+]
+
+
+def _parse_release_check(raw: Optional[str]) -> Optional[dict]:
+    """Parse a {"released": bool, "title": ..., "year": ...} JSON answer."""
+    if not raw:
+        return None
+
+    raw = raw.strip()
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw)
+
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
         return None
 
     try:
-        prompt = f"""You are a music expert. What is the album name for the song "{song_title}" by {artist_name}?
-
-IMPORTANT: Respond ONLY with the album name. Do not add any other text or explanation.
-If you don't know, respond with 'NONE'."""
-
-        headers = {
-            'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-
-        data = {
-            'model': 'deepseek-chat',
-            'messages': [
-                {'role': 'system', 'content': 'You are a music expert. Respond ONLY with the album name or "NONE".'},
-                {'role': 'user', 'content': prompt}
-            ],
-            'temperature': 0.1,
-            'max_tokens': 50
-        }
-
-        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=10)
-        resp.raise_for_status()
-
-        result = resp.json()
-        album_name = result['choices'][0]['message']['content'].strip()
-
-        if album_name and album_name != 'NONE':
-            return album_name
-
+        parsed = json.loads(match.group())
+    except json.JSONDecodeError:
         return None
 
-    except Exception as e:
-        print(f"      ⚠️ DeepSeek album lookup error: {e}")
+    if not parsed.get('released'):
         return None
 
+    title = parsed.get('title')
+    if not title or not isinstance(title, str):
+        return None
 
-def find_album_in_db(album_map: Dict[int, Dict[str, int]], id_artist: int, album_name: str) -> int:
+    year = parsed.get('year')
+    try:
+        year = int(year)
+        current_year = datetime.now().year
+        if not (1900 <= year <= current_year + 1):
+            year = None
+    except (TypeError, ValueError):
+        year = None
+
+    return {'title': title.strip(), 'year': year}
+
+
+def _deepseek_release_check(artist_name: str, song_title: str, description: str) -> Optional[str]:
+    """Ask a single strict yes/no question for one release type. Returns raw content or None."""
+    prompt = f"""Was the song "{song_title}" by {artist_name} originally released on {description}?
+
+Respond ONLY with a JSON object, no markdown, no extra text:
+- If yes: {{"released": true, "title": "<exact release title>", "year": <4-digit release year as integer>}}
+- If no: {{"released": false}}
+
+Be strict — only answer true if this is genuinely the release where the song FIRST appeared."""
+
+    headers = {
+        'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+
+    data = {
+        'model': 'deepseek-chat',
+        'messages': [
+            {'role': 'system', 'content': 'You are a music discography expert. Respond ONLY with a valid JSON object, no markdown, no extra text.'},
+            {'role': 'user', 'content': prompt}
+        ],
+        'temperature': 0.1,
+        'max_tokens': 100
+    }
+
+    resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=15)
+    resp.raise_for_status()
+
+    result = resp.json()
+    return result['choices'][0]['message']['content']
+
+
+def get_album_info_from_deepseek(artist_name: str, song_title: str) -> Optional[dict]:
     """
-    Search for album in album_map with fuzzy matching (case-insensitive, trim).
-    Returns id_album if found, else 0.
+    Ask DeepSeek for the ORIGINAL release where a song first appeared.
+
+    Instead of asking one combined question and hoping the model respects a
+    priority order in its own reasoning, this checks each release type
+    ONE AT A TIME, in strict order, and stops at the first "yes":
+        1. Studio Album (LP)
+        2. EP
+        3. Single
+        4. Greatest Hits / Best Of (only if truly exclusive to it)
+        5. Live album (only if never released in studio form at all)
+
+    This procedurally forces the priority order — the model never gets a
+    chance to jump straight to "single" or "greatest hits" while skipping
+    over "album", because we simply never ask about those until the album
+    question has already come back negative.
+
+    Most songs resolve on the very first question (they're on a studio
+    album), so this is typically NOT more expensive than a single combined
+    call — it only takes extra calls for the rarer single/live/comp-only
+    tracks.
+
+    Returns {'album': str, 'year': int, 'type': str} or None.
     """
-    if not album_name:
+    if not DEEPSEEK_API_KEY:
+        return None
+
+    cache_key = f"{artist_name.lower()}|||{song_title.lower()}"
+    if cache_key in album_ai_cache:
+        return album_ai_cache[cache_key]
+
+    for album_type, description in RELEASE_TYPE_STEPS:
+        try:
+            raw = _deepseek_release_check(artist_name, song_title, description)
+        except Exception as e:
+            print(f"      ⚠️ DeepSeek album lookup error ({album_type}) for '{artist_name} - {song_title}': {e}")
+            continue
+
+        parsed = _parse_release_check(raw)
+        if parsed:
+            info = {'album': parsed['title'], 'year': parsed['year'], 'type': album_type}
+            album_ai_cache[cache_key] = info
+            return info
+
+        # Small courtesy delay between sequential steps
+        time.sleep(0.2)
+
+    album_ai_cache[cache_key] = None
+    return None
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, trim, collapse whitespace for comparisons."""
+    return re.sub(r'\s+', ' ', title or '').strip().lower()
+
+
+def find_album_in_db_smart(album_map: Dict[int, List[dict]], id_artist: int,
+                            candidate_title: str, candidate_year: Optional[int] = None) -> int:
+    """
+    Match a candidate album (title + optional year) against the artist's
+    albums in 2_album_raw, disambiguating between editions of the same
+    title (original vs remaster/deluxe/etc.) using release_year.
+
+    Matching order:
+      1. Exact title + exact year        -> most reliable, picks the right edition
+      2. Exact title, closest year       -> AI got the title right, year slightly off
+      3. Fuzzy/partial title match       -> tie-broken by type priority (album>ep>single>live)
+                                             then earliest year
+
+    Returns id_album, or 0 if nothing matches.
+    """
+    if not candidate_title or id_artist not in album_map:
         return 0
-    
-    if id_artist not in album_map:
-        return 0
-    
-    album_name_clean = album_name.strip()
-    album_name_lower = album_name_clean.lower()
-    
-    # Exact match (case-insensitive)
-    for title, id_album in album_map[id_artist].items():
-        if title.lower() == album_name_lower:
-            return id_album
-    
-    # Partial match (if album name contains the search term)
-    for title, id_album in album_map[id_artist].items():
-        if album_name_lower in title.lower() or title.lower() in album_name_lower:
-            return id_album
-    
+
+    candidates = album_map[id_artist]
+    target = _normalize_title(candidate_title)
+
+    # 1. Exact title + exact year
+    if candidate_year:
+        for c in candidates:
+            if _normalize_title(c['title']) == target and c['year'] == candidate_year:
+                return c['id_album']
+
+    # 2. Exact title, closest year (or first one if no year to compare)
+    same_title = [c for c in candidates if _normalize_title(c['title']) == target]
+    if same_title:
+        if candidate_year:
+            same_title.sort(key=lambda c: abs((c['year'] or 9999) - candidate_year))
+        else:
+            same_title.sort(key=lambda c: ALBUM_TYPE_PRIORITY.get(c['type'], 9))
+        return same_title[0]['id_album']
+
+    # 3. Fuzzy/partial title match, prefer original album type + earliest year
+    partial = [
+        c for c in candidates
+        if target in _normalize_title(c['title']) or _normalize_title(c['title']) in target
+    ]
+    if partial:
+        partial.sort(key=lambda c: (ALBUM_TYPE_PRIORITY.get(c['type'], 9), c['year'] or 9999))
+        return partial[0]['id_album']
+
     return 0
 
 
 def find_album_for_song(artist_name: str, song_title: str, album_from_scrobble: str,
-                         album_map: Dict[int, Dict[str, int]], id_artist: int) -> Tuple[int, str]:
+                         album_map: Dict[int, List[dict]], id_artist: int) -> Tuple[int, str]:
     """
-    Find album ID for a song.
+    Find album ID for a song, preferring the ORIGINAL release
+    (Album > EP > Single > Live, earliest year).
+
+    DeepSeek is the primary source: it's asked directly for the original
+    release (title + year + type), which lets us match precisely against
+    2_album_raw on (title, release_year) instead of guessing from whichever
+    album name a scrobble/Last.fm/MusicBrainz happens to report (which is
+    often a reissue, live album, or compilation).
+
     Returns (id_album, source).
-    Sources: 'scrobble', 'lastfm', 'musicbrainz', 'deepseek', 'none'
+    Sources: 'deepseek', 'scrobble', 'lastfm', 'musicbrainz', 'none'
     """
-    # 1. Try from scrobble data
-    if album_from_scrobble:
-        id_album = find_album_in_db(album_map, id_artist, album_from_scrobble)
-        if id_album > 0:
-            return id_album, 'scrobble'
-    
-    # 2. Try Last.fm track.getInfo
-    album_name = get_album_from_lastfm_track(artist_name, song_title)
-    if album_name:
-        id_album = find_album_in_db(album_map, id_artist, album_name)
-        if id_album > 0:
-            return id_album, 'lastfm'
-    
-    # 3. Try MusicBrainz
-    album_name = get_album_from_musicbrainz(artist_name, song_title)
-    if album_name:
-        id_album = find_album_in_db(album_map, id_artist, album_name)
-        if id_album > 0:
-            return id_album, 'musicbrainz'
-    
-    # 4. Try DeepSeek (last resort)
-    album_name = get_album_from_deepseek(artist_name, song_title)
-    if album_name:
-        id_album = find_album_in_db(album_map, id_artist, album_name)
+    # 1. Ask DeepSeek for the canonical original release
+    ai_info = get_album_info_from_deepseek(artist_name, song_title)
+    if ai_info and ai_info.get('album'):
+        id_album = find_album_in_db_smart(album_map, id_artist, ai_info['album'], ai_info.get('year'))
         if id_album > 0:
             return id_album, 'deepseek'
-    
+
+    # 2. Fallback: album reported on the scrobble itself
+    if album_from_scrobble:
+        id_album = find_album_in_db_smart(album_map, id_artist, album_from_scrobble)
+        if id_album > 0:
+            return id_album, 'scrobble'
+
+    # 3. Fallback: Last.fm track.getInfo
+    album_name = get_album_from_lastfm_track(artist_name, song_title)
+    if album_name:
+        id_album = find_album_in_db_smart(album_map, id_artist, album_name)
+        if id_album > 0:
+            return id_album, 'lastfm'
+
+    # 4. Fallback: MusicBrainz
+    album_name = get_album_from_musicbrainz(artist_name, song_title)
+    if album_name:
+        id_album = find_album_in_db_smart(album_map, id_artist, album_name)
+        if id_album > 0:
+            return id_album, 'musicbrainz'
+
     return 0, 'none'
 
 
@@ -493,22 +634,29 @@ def load_artist_map() -> dict:
     return mapping
 
 
-def load_album_map() -> Dict[int, Dict[str, int]]:
+def load_album_map() -> Dict[int, List[dict]]:
     """
-    Loads all albums into memory as a nested dict:
-    {id_artist: {album_title: id_album}}
+    Loads all albums into memory as:
+    {id_artist: [ {title, year, type, id_album}, ... ]}
+
+    Loading release_year and album_type (not just title) is what lets
+    find_album_in_db_smart tell apart the original 1973 release from a
+    2010 remaster of the same title.
     (No JOIN with Artist to avoid cross-database issues.)
     """
     album_conn = sqlite3.connect(ALBUM_DB_PATH)
     cursor = album_conn.cursor()
-    cursor.execute('SELECT id_artist, title, id_album FROM Album')
-    
-    album_map = {}
-    for id_artist, album_title, id_album in cursor.fetchall():
-        if id_artist not in album_map:
-            album_map[id_artist] = {}
-        album_map[id_artist][album_title] = id_album
-    
+    cursor.execute('SELECT id_artist, title, release_year, album_type, id_album FROM Album')
+
+    album_map: Dict[int, List[dict]] = {}
+    for id_artist, title, release_year, album_type, id_album in cursor.fetchall():
+        album_map.setdefault(id_artist, []).append({
+            'title': title,
+            'year': release_year,
+            'type': (album_type or '').strip().lower(),
+            'id_album': id_album
+        })
+
     album_conn.close()
     return album_map
 

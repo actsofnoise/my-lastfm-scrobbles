@@ -3,7 +3,7 @@ name: 3. Update Songs from Last.fm
 on:
   schedule:
     # Run daily at 5:45 AM UTC (after albums update)
-    - cron: '45 5 * * *'
+    # - cron: '45 5 * * *'
   workflow_dispatch:  # Allow manual trigger
 
 permissions:

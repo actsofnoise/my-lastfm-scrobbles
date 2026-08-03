@@ -5,10 +5,22 @@ This module fetches album data from MusicBrainz for artists in the filtered arti
 It retrieves:
 - Album title
 - Release year and date
-- Album type (studio, live, compilation, etc.)
+- Primary type (album, ep, single, live, compilation...) + secondary types, as separate fields
 - Total tracks
 - Label (record label)
-- Cover URL (from: Last.fm → Deezer → DeepSeek)
+- Cover URL (from: Cover Art Archive → Last.fm → Deezer)
+- is_reissue flag (remaster/deluxe/anniversary/expanded editions, detected from title)
+
+KEY DESIGN CHOICE — release-groups, not releases:
+MusicBrainz's "release" entity is a single physical/digital pressing (UK CD,
+US vinyl, Japan reissue, streaming release...) — a real album can have a
+dozen of these. Querying at that level floods the Album table with near-
+duplicate rows for the same actual album, which is exactly what confuses
+downstream album-matching (a song ending up assigned to some obscure
+reissue instead of the original). "release-group" is MusicBrainz's own
+abstraction for "the album, regardless of edition" — this script queries
+at that level, and only pulls ONE representative OFFICIAL release per
+release-group (never bootleg/promo-only) to get track count / label.
 
 OPTIMIZATION:
 - If artist exists in Album table → fetch only releases from last 2 years.
@@ -43,10 +55,8 @@ ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data',
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
-DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
 
 LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
-DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions'
 DEEZER_API_URL = 'https://api.deezer.com/search/album'
 
 # Configure MusicBrainz
@@ -122,73 +132,55 @@ def get_cover_from_deezer(artist_name: str, album_title: str) -> Optional[str]:
         return None
 
 
-def get_cover_from_deepseek(artist_name: str, album_title: str) -> Optional[str]:
-    """Get album cover from DeepSeek API (last resort)."""
-    if not DEEPSEEK_API_KEY:
+def get_cover_from_coverartarchive(release_group_mbid: str) -> Optional[str]:
+    """
+    Get album cover from the Cover Art Archive, MusicBrainz's own cover
+    art service — indexed directly by release-group MBID, so this is an
+    exact lookup, not a fuzzy text search. Far more reliable than asking
+    an LLM to "remember" a cover URL (which it can't verify exists at all).
+    """
+    if not release_group_mbid:
         return None
 
     try:
-        prompt = f"""You are a music assistant. Find the official album cover URL for the album '{album_title}' by {artist_name}.
-
-IMPORTANT:
-- Respond ONLY with the image URL.
-- Do not add any other text or explanation.
-- If you can't find a valid cover URL, respond with 'NONE'."""
-
-        headers = {
-            'Authorization': f'Bearer {DEEPSEEK_API_KEY}',
-            'Content-Type': 'application/json'
-        }
-
-        data = {
-            'model': 'deepseek-chat',
-            'messages': [
-                {'role': 'system', 'content': 'You are a music assistant. Respond ONLY with a valid image URL or "NONE".'},
-                {'role': 'user', 'content': prompt}
-            ],
-            'temperature': 0.1,
-            'max_tokens': 150
-        }
-
-        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=15)
-        resp.raise_for_status()
-
-        result = resp.json()
-        cover_url = result['choices'][0]['message']['content'].strip()
-
-        if cover_url and cover_url != 'NONE' and cover_url.startswith('http'):
-            return cover_url
-
+        url = f"https://coverartarchive.org/release-group/{release_group_mbid}/front-500"
+        resp = requests.head(url, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            return url
         return None
-
     except Exception as e:
-        print(f"      ⚠️ DeepSeek cover error: {e}")
+        print(f"      ⚠️ Cover Art Archive error: {e}")
         return None
 
 
-def get_album_cover(artist_name: str, album_title: str) -> tuple:
+def get_album_cover(artist_name: str, album_title: str, release_group_mbid: str = None) -> tuple:
     """
     Get album cover using multiple sources in order:
-    1. Last.fm
-    2. Deezer
-    3. DeepSeek (last resort)
+    1. Cover Art Archive (exact match by release-group MBID, when available)
+    2. Last.fm (fuzzy text search)
+    3. Deezer (fuzzy text search)
+
+    DeepSeek was removed as a cover source: an LLM has no way to verify a
+    cover URL actually exists, so it's pure hallucination risk for zero
+    benefit now that we have an exact MBID-based lookup available.
 
     Returns (cover_url, source)
     """
-    # 1. Try Last.fm
+    # 1. Try Cover Art Archive (exact, MBID-based)
+    if release_group_mbid:
+        cover = get_cover_from_coverartarchive(release_group_mbid)
+        if cover:
+            return cover, 'coverartarchive'
+
+    # 2. Try Last.fm
     cover = get_cover_from_lastfm(artist_name, album_title)
     if cover:
         return cover, 'lastfm'
 
-    # 2. Try Deezer
+    # 3. Try Deezer
     cover = get_cover_from_deezer(artist_name, album_title)
     if cover:
         return cover, 'deezer'
-
-    # 3. Try DeepSeek (last resort)
-    cover = get_cover_from_deepseek(artist_name, album_title)
-    if cover:
-        return cover, 'deepseek'
 
     return None, None
 
@@ -213,6 +205,9 @@ def create_schema(conn):
                 release_year INTEGER,
                 release_date TEXT,
                 album_type   TEXT,
+                secondary_types TEXT,
+                is_reissue   INTEGER DEFAULT 0,
+                mbid         TEXT,
                 total_tracks INTEGER,
                 label        TEXT,
                 producer     TEXT,
@@ -238,6 +233,18 @@ def create_schema(conn):
         if 'producer' not in existing_columns:
             cursor.execute('ALTER TABLE Album ADD COLUMN producer TEXT')
             print("✅ Added column: producer")
+
+        if 'secondary_types' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN secondary_types TEXT')
+            print("✅ Added column: secondary_types")
+
+        if 'is_reissue' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN is_reissue INTEGER DEFAULT 0')
+            print("✅ Added column: is_reissue")
+
+        if 'mbid' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN mbid TEXT')
+            print("✅ Added column: mbid")
 
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_artist ON Album (id_artist)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_title ON Album (title)')
@@ -288,7 +295,8 @@ def album_exists(conn, id_artist: int, title: str, release_year: int = None) -> 
 
 def save_album(conn, artist_id: int, title: str, release_year: int = None,
                release_date: str = None, album_type: str = None,
-               total_tracks: int = None, label: str = None,
+               secondary_types: str = None, is_reissue: bool = False,
+               mbid: str = None, total_tracks: int = None, label: str = None,
                producer: str = None, cover_url: str = None,
                cover_source: str = None):
     """Insert a new album into the database."""
@@ -296,10 +304,12 @@ def save_album(conn, artist_id: int, title: str, release_year: int = None,
     cursor.execute('''
         INSERT OR IGNORE INTO Album (
             id_artist, title, release_year, release_date, album_type,
+            secondary_types, is_reissue, mbid,
             total_tracks, label, producer, cover_url, cover_source, last_update
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ''', (artist_id, title, release_year, release_date, album_type,
+          secondary_types, int(bool(is_reissue)), mbid,
           total_tracks, label, producer, cover_url, cover_source))
     conn.commit()
 
@@ -326,6 +336,23 @@ def get_last_update_time(conn) -> Optional[str]:
 # MUSICBRAINZ FUNCTIONS
 # ============================================
 
+# Patterns that indicate a release-group is a reissue/remaster/deluxe
+# variant rather than the original release. Used only to FLAG these
+# (is_reissue), never to discard them — the original strategy discussion
+# was clear that they should be flagged for downstream prioritization, not
+# silently dropped.
+REISSUE_PATTERNS = re.compile(
+    r'\((?:remaster(?:ed)?|deluxe|anniversary|expanded|bonus track|'
+    r'special edition|reissue|legacy edition|super deluxe)[^)]*\)',
+    re.IGNORECASE
+)
+
+
+def is_reissue_title(title: str) -> bool:
+    """Detect remaster/deluxe/anniversary/etc. editions from the title."""
+    return bool(REISSUE_PATTERNS.search(title or ''))
+
+
 def search_artist_mbid(artist_name: str) -> Optional[str]:
     """Search for an artist in MusicBrainz and return the MBID."""
     try:
@@ -339,95 +366,107 @@ def search_artist_mbid(artist_name: str) -> Optional[str]:
         return None
 
 
-def get_artist_releases(artist_mbid: str, since_year: int = None) -> List[Dict[str, Any]]:
+def get_artist_release_groups(artist_mbid: str, since_year: int = None) -> List[Dict[str, Any]]:
     """
-    Get releases for an artist from MusicBrainz.
-    If since_year is provided, only fetch releases from that year onwards.
+    Get release-groups for an artist from MusicBrainz — this is the "album,
+    regardless of edition" abstraction, NOT individual physical/digital
+    releases. A single browse_releases() call can return a dozen near-
+    duplicate rows (UK CD, US vinyl, Japan reissue...) for the same real
+    album; browse_release_groups() collapses all of those into one entry,
+    which is what we actually want to store as "an album".
+
+    If since_year is provided, only returns groups first released from
+    that year onwards (same manual filtering approach as before, since the
+    API doesn't support server-side year filtering here).
     """
     try:
-        # Build query with date filter if provided
+        result = musicbrainzngs.browse_release_groups(
+            artist=artist_mbid,
+            includes=['artist-credits'],
+            limit=100
+        )
+        groups = result.get('release-group-list', [])
+
         if since_year:
-            # MusicBrainz supports date filtering in browse_releases
-            # We'll filter after fetching since the API doesn't support year filtering directly
-            result = musicbrainzngs.browse_releases(
-                artist=artist_mbid,
-                includes=['release-groups'],
-                limit=100
-            )
-            releases = result.get('release-list', [])
-            
-            # Filter releases by year
             filtered = []
-            for release in releases:
-                date_str = release.get('date', '')
+            for rg in groups:
+                date_str = rg.get('first-release-date', '')
                 if date_str:
                     year_match = re.search(r'^(\d{4})', date_str)
-                    if year_match:
-                        release_year = int(year_match.group(1))
-                        if release_year >= since_year:
-                            filtered.append(release)
+                    if year_match and int(year_match.group(1)) >= since_year:
+                        filtered.append(rg)
                 else:
-                    # If no date, include it (we want to be safe)
-                    filtered.append(release)
+                    # No date on record — include it to be safe, same
+                    # policy as the previous release-level implementation.
+                    filtered.append(rg)
             return filtered
-        else:
-            # Fetch all releases
-            result = musicbrainzngs.browse_releases(
-                artist=artist_mbid,
-                includes=['release-groups'],
-                limit=100
-            )
-            return result.get('release-list', [])
+
+        return groups
     except Exception as e:
-        print(f"      ⚠️ MusicBrainz releases error: {e}")
+        print(f"      ⚠️ MusicBrainz release-groups error: {e}")
         return []
 
 
-def parse_release(release: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse a MusicBrainz release dict into our format."""
-    title = release.get('title', '')
+def get_official_release_details(release_group_mbid: str) -> Optional[Dict[str, Any]]:
+    """
+    Look up ONE representative OFFICIAL release within a release-group, to
+    pull track count and label. Deliberately skips bootleg/promotion-only
+    editions — if a release-group has no official release at all, we treat
+    it as not a real canonical album and return None (caller skips it).
+    This is what keeps promos/bootlegs out of the Album table at the
+    source, instead of relying on downstream AI matching to filter them.
+    """
+    try:
+        result = musicbrainzngs.browse_releases(
+            release_group=release_group_mbid,
+            includes=['media', 'labels'],
+            limit=25
+        )
+        releases = result.get('release-list', [])
+        official = [r for r in releases if r.get('status', '').lower() == 'official']
 
-    date_str = release.get('date', '')
+        if not official:
+            return None
+
+        release = official[0]
+
+        label_info = release.get('label-info-list', [])
+        label = label_info[0].get('label', {}).get('name', '') if label_info else None
+
+        total_tracks = 0
+        for medium in release.get('medium-list', []):
+            total_tracks += len(medium.get('track-list', []))
+
+        return {'total_tracks': total_tracks, 'label': label}
+
+    except Exception as e:
+        print(f"      ⚠️ MusicBrainz official-release lookup error: {e}")
+        return None
+
+
+def parse_release_group(rg: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse a MusicBrainz release-group dict into our format."""
+    title = rg.get('title', '')
+
+    date_str = rg.get('first-release-date', '')
     release_year = None
-    release_date = None
     if date_str:
-        try:
-            year_match = re.search(r'^(\d{4})', date_str)
-            if year_match:
-                release_year = int(year_match.group(1))
-            if len(date_str) >= 10:
-                release_date = date_str
-            else:
-                release_date = date_str
-        except:
-            pass
+        year_match = re.search(r'^(\d{4})', date_str)
+        if year_match:
+            release_year = int(year_match.group(1))
 
-    release_group = release.get('release-group', {})
-    primary_type = release_group.get('primary-type', '')
-    secondary_types = release_group.get('secondary-types', [])
-    album_type = primary_type.lower() if primary_type else 'unknown'
-    if secondary_types:
-        album_type = f"{album_type} / {' / '.join(secondary_types)}".lower()
-
-    label_info = release.get('label-info-list', [])
-    label = None
-    if label_info:
-        label = label_info[0].get('label', {}).get('name', '')
-
-    medium_list = release.get('medium-list', [])
-    total_tracks = 0
-    for medium in medium_list:
-        track_list = medium.get('track-list', [])
-        total_tracks += len(track_list)
+    primary_type = (rg.get('primary-type') or 'unknown').lower()
+    secondary_types = rg.get('secondary-type-list', [])
+    secondary_types_str = ', '.join(t.lower() for t in secondary_types) if secondary_types else None
 
     return {
+        'mbid': rg.get('id'),
         'title': title,
         'release_year': release_year,
-        'release_date': release_date,
-        'album_type': album_type,
-        'total_tracks': total_tracks,
-        'label': label,
-        'producer': None,
+        'release_date': date_str or None,
+        'album_type': primary_type,
+        'secondary_types': secondary_types_str,
+        'is_reissue': is_reissue_title(title),
     }
 
 
@@ -440,8 +479,15 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
     Fetch and save albums for a single artist.
     - If artist has existing albums: fetch only releases from last 2 years.
     - If artist is new: fetch full discography.
+
+    Queries MusicBrainz at the release-GROUP level (one row per actual
+    album, not per physical/digital edition), and only keeps groups that
+    have at least one OFFICIAL release — bootleg/promo-only groups are
+    skipped entirely, at the source, rather than relying on downstream
+    matching to filter them out later.
     """
     new_albums = 0
+    skipped_no_official = 0
     
     # Check if artist already has albums
     album_count = get_artist_album_count(album_conn, artist_id)
@@ -462,34 +508,45 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
         print(f"   ⚠️ No MusicBrainz ID found for '{artist_name}'")
         return 0
 
-    # Get releases
-    releases = get_artist_releases(mbid, since_year)
-    if not releases:
+    # Get release-groups (the "album, regardless of edition" abstraction)
+    release_groups = get_artist_release_groups(mbid, since_year)
+    if not release_groups:
         print(f"   ⚠️ No releases found for '{artist_name}'")
         return 0
 
     if since_year:
-        print(f"   📀 Found {len(releases)} recent releases (since {since_year})")
+        print(f"   📀 Found {len(release_groups)} recent release-groups (since {since_year})")
     else:
-        print(f"   📀 Found {len(releases)} total releases")
+        print(f"   📀 Found {len(release_groups)} total release-groups")
 
-    for release in releases:
-        if not release.get('title'):
+    for rg in release_groups:
+        if not rg.get('title'):
             continue
 
-        parsed = parse_release(release)
+        parsed = parse_release_group(rg)
 
         # Skip if album already exists (prevent duplicates)
         if album_exists(album_conn, artist_id, parsed['title'], parsed['release_year']):
             continue
 
-        # Get cover URL with fallbacks
-        cover_url, cover_source = get_album_cover(artist_name, parsed['title'])
+        # Only keep release-groups that have at least one OFFICIAL release.
+        # A group whose only releases are bootlegs/promos is not a real
+        # canonical album — this is the main fix for songs ending up
+        # assigned to demos/promos downstream.
+        details = get_official_release_details(parsed['mbid'])
+        if details is None:
+            skipped_no_official += 1
+            time.sleep(0.2)
+            continue
 
+        # Get cover URL with fallbacks (Cover Art Archive first, exact MBID match)
+        cover_url, cover_source = get_album_cover(artist_name, parsed['title'], parsed['mbid'])
+
+        tag = " [REISSUE]" if parsed['is_reissue'] else ""
         if cover_url:
-            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [cover: {cover_source}]")
+            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [{parsed['album_type']}]{tag} [cover: {cover_source}]")
         else:
-            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [no cover]")
+            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [{parsed['album_type']}]{tag} [no cover]")
 
         save_album(
             album_conn,
@@ -498,9 +555,12 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
             release_year=parsed['release_year'],
             release_date=parsed['release_date'],
             album_type=parsed['album_type'],
-            total_tracks=parsed['total_tracks'],
-            label=parsed['label'],
-            producer=parsed['producer'],
+            secondary_types=parsed['secondary_types'],
+            is_reissue=parsed['is_reissue'],
+            mbid=parsed['mbid'],
+            total_tracks=details['total_tracks'],
+            label=details['label'],
+            producer=None,
             cover_url=cover_url,
             cover_source=cover_source
         )
@@ -508,6 +568,9 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
 
         # Avoid rate limiting
         time.sleep(0.2)
+
+    if skipped_no_official:
+        print(f"   ⏭️  Skipped {skipped_no_official} release-group(s) with no official release (bootleg/promo-only)")
 
     return new_albums
 

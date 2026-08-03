@@ -1,0 +1,32 @@
+name: 🧪 Test - Web Search Grounding
+
+on:
+  workflow_dispatch:  # Manual trigger only — this is a one-off diagnostic test
+
+permissions:
+  contents: read  # This script doesn't write anything, no push needed
+
+jobs:
+  test-web-grounding:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install openai google-genai python-dotenv
+
+      - name: 🧪 Run web grounding test
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python script/test_web_grounding.py

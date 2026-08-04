@@ -1,0 +1,47 @@
+name: 🧪 Test - Tracklist Cache (100 songs)
+
+on:
+  workflow_dispatch:  # Manual trigger only — this is a bounded test run
+
+permissions:
+  contents: write  # Commits the resulting test DB so you can inspect it afterward
+
+jobs:
+  test-tracklist-cache:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 📁 Create data directory
+        run: mkdir -p data
+
+      - name: 🧪 Run tracklist-cache test (100 songs)
+        env:
+          LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+          LASTFM_USER: ${{ secrets.LASTFM_USER }}
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python script/3_song_db_test_tracklist.py
+
+      - name: 💾 Commit and push test database
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/3_songs_test_tracklist.db
+          git diff --staged --quiet || git commit -m "Test run: tracklist-cache strategy (100 songs) [skip ci]"
+          git push

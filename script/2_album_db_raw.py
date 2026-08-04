@@ -34,6 +34,7 @@ import sys
 import requests
 import time
 import re
+import json
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
@@ -213,6 +214,8 @@ def create_schema(conn):
                 producer     TEXT,
                 cover_url    TEXT,
                 cover_source TEXT,
+                tracklist_json   TEXT,
+                tracklist_source TEXT,
                 last_update  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (id_artist, title, release_year)
             )
@@ -245,6 +248,14 @@ def create_schema(conn):
         if 'mbid' not in existing_columns:
             cursor.execute('ALTER TABLE Album ADD COLUMN mbid TEXT')
             print("✅ Added column: mbid")
+
+        if 'tracklist_json' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN tracklist_json TEXT')
+            print("✅ Added column: tracklist_json")
+
+        if 'tracklist_source' not in existing_columns:
+            cursor.execute('ALTER TABLE Album ADD COLUMN tracklist_source TEXT')
+            print("✅ Added column: tracklist_source")
 
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_artist ON Album (id_artist)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_album_title ON Album (title)')
@@ -298,19 +309,24 @@ def save_album(conn, artist_id: int, title: str, release_year: int = None,
                secondary_types: str = None, is_reissue: bool = False,
                mbid: str = None, total_tracks: int = None, label: str = None,
                producer: str = None, cover_url: str = None,
-               cover_source: str = None):
+               cover_source: str = None, tracklist: Optional[List[str]] = None,
+               tracklist_source: str = None):
     """Insert a new album into the database."""
+    tracklist_json = json.dumps(tracklist, ensure_ascii=False) if tracklist else None
+
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR IGNORE INTO Album (
             id_artist, title, release_year, release_date, album_type,
             secondary_types, is_reissue, mbid,
-            total_tracks, label, producer, cover_url, cover_source, last_update
+            total_tracks, label, producer, cover_url, cover_source,
+            tracklist_json, tracklist_source, last_update
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     ''', (artist_id, title, release_year, release_date, album_type,
           secondary_types, int(bool(is_reissue)), mbid,
-          total_tracks, label, producer, cover_url, cover_source))
+          total_tracks, label, producer, cover_url, cover_source,
+          tracklist_json, tracklist_source))
     conn.commit()
 
 
@@ -410,16 +426,23 @@ def get_artist_release_groups(artist_mbid: str, since_year: int = None) -> List[
 def get_official_release_details(release_group_mbid: str) -> Optional[Dict[str, Any]]:
     """
     Look up ONE representative OFFICIAL release within a release-group, to
-    pull track count and label. Deliberately skips bootleg/promotion-only
-    editions — if a release-group has no official release at all, we treat
-    it as not a real canonical album and return None (caller skips it).
-    This is what keeps promos/bootlegs out of the Album table at the
-    source, instead of relying on downstream AI matching to filter them.
+    pull track count, label, AND the real ordered tracklist. Deliberately
+    skips bootleg/promotion-only editions — if a release-group has no
+    official release at all, we treat it as not a real canonical album and
+    return None (caller skips it). This is what keeps promos/bootlegs out
+    of the Album table at the source, instead of relying on downstream AI
+    matching to filter them.
+
+    The tracklist (song titles, in order) is what makes song-to-album
+    assignment downstream a simple membership check instead of an AI
+    guess for the common case — we're already paying for this API call
+    for total_tracks/label, 'recordings' just asks it to also include the
+    actual track titles in the same response, at no extra request cost.
     """
     try:
         result = musicbrainzngs.browse_releases(
             release_group=release_group_mbid,
-            includes=['media', 'labels'],
+            includes=['media', 'labels', 'recordings'],
             limit=25
         )
         releases = result.get('release-list', [])
@@ -434,14 +457,95 @@ def get_official_release_details(release_group_mbid: str) -> Optional[Dict[str, 
         label = label_info[0].get('label', {}).get('name', '') if label_info else None
 
         total_tracks = 0
+        tracklist = []
         for medium in release.get('medium-list', []):
-            total_tracks += len(medium.get('track-list', []))
+            for track in medium.get('track-list', []):
+                total_tracks += 1
+                title = track.get('recording', {}).get('title') or track.get('title')
+                if title:
+                    tracklist.append(title)
 
-        return {'total_tracks': total_tracks, 'label': label}
+        return {'total_tracks': total_tracks, 'label': label, 'tracklist': tracklist}
 
     except Exception as e:
         print(f"      ⚠️ MusicBrainz official-release lookup error: {e}")
         return None
+
+
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+
+
+def get_tracklist_from_wikipedia(artist_name: str, album_title: str) -> Optional[List[str]]:
+    """
+    Best-effort tracklist fetch from Wikipedia's {{Track listing}} infobox
+    template. Used ONLY as a fallback when MusicBrainz didn't have a
+    track-level listing for this release (rarer for well-known albums,
+    more common for smaller/less-catalogued ones).
+
+    This parses raw wikitext with regex, which is inherently a bit fragile
+    — article formatting varies — so it's best-effort, not guaranteed.
+    Returns None (not an empty list) on any failure/no-match, so the
+    caller can tell "found nothing" apart from "found zero tracks".
+    """
+    try:
+        search_params = {
+            'action': 'query',
+            'list': 'search',
+            'srsearch': f'{album_title} {artist_name} album',
+            'format': 'json',
+            'srlimit': 3,
+        }
+        resp = requests.get(WIKIPEDIA_API_URL, params=search_params, timeout=15)
+        resp.raise_for_status()
+        results = resp.json().get('query', {}).get('search', [])
+        if not results:
+            return None
+        page_title = results[0]['title']
+
+        parse_params = {
+            'action': 'parse',
+            'page': page_title,
+            'prop': 'wikitext',
+            'format': 'json',
+        }
+        resp = requests.get(WIKIPEDIA_API_URL, params=parse_params, timeout=15)
+        resp.raise_for_status()
+        wikitext = resp.json().get('parse', {}).get('wikitext', {}).get('*', '')
+        if not wikitext:
+            return None
+
+        tracks = []
+        block_matches = re.findall(r'\{\{Track listing.*?\n\}\}', wikitext, re.DOTALL | re.IGNORECASE)
+        for block in block_matches:
+            for raw_title in re.findall(r'\btitle\d*\s*=\s*(.+)', block):
+                clean = re.sub(r"\[\[(?:[^\|\]]*\|)?([^\]]+)\]\]", r"\1", raw_title)  # [[link|Text]] -> Text
+                clean = re.sub(r"'''?", '', clean)  # strip bold/italic wiki markup
+                clean = clean.strip().strip('"').strip()
+                if clean:
+                    tracks.append(clean)
+
+        return tracks if tracks else None
+
+    except Exception as e:
+        print(f"      ⚠️ Wikipedia tracklist error: {e}")
+        return None
+
+
+def get_tracklist(release_group_mbid: str, artist_name: str, album_title: str,
+                   mb_tracklist: Optional[List[str]]) -> tuple:
+    """
+    Resolve the ordered tracklist for an album: MusicBrainz first (already
+    fetched, real/verified), Wikipedia as fallback when MB had nothing.
+    Returns (tracklist_list_or_None, source_string_or_None).
+    """
+    if mb_tracklist:
+        return mb_tracklist, 'musicbrainz'
+
+    wiki_tracklist = get_tracklist_from_wikipedia(artist_name, album_title)
+    if wiki_tracklist:
+        return wiki_tracklist, 'wikipedia'
+
+    return None, None
 
 
 def parse_release_group(rg: Dict[str, Any]) -> Dict[str, Any]:
@@ -539,14 +643,29 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
             time.sleep(0.2)
             continue
 
+        # Resolve the ordered tracklist: MusicBrainz first (already fetched
+        # above, real/verified), Wikipedia as a fallback when MB had none.
+        tracklist, tracklist_source = get_tracklist(
+            parsed['mbid'], artist_name, parsed['title'], details.get('tracklist')
+        )
+
+        # Sanity check: if we got a tracklist, its length should roughly
+        # match MusicBrainz's own track count. A mismatch is a signal this
+        # might be the wrong edition (e.g. Wikipedia matched a deluxe
+        # version with bonus tracks) — just a warning, not a blocker.
+        if tracklist and details.get('total_tracks') and len(tracklist) != details['total_tracks']:
+            print(f"      ⚠️ Tracklist length ({len(tracklist)}) doesn't match "
+                  f"MusicBrainz track count ({details['total_tracks']}) — possibly a different edition.")
+
         # Get cover URL with fallbacks (Cover Art Archive first, exact MBID match)
         cover_url, cover_source = get_album_cover(artist_name, parsed['title'], parsed['mbid'])
 
         tag = " [REISSUE]" if parsed['is_reissue'] else ""
+        track_info = f" [{len(tracklist)} tracks: {tracklist_source}]" if tracklist else " [no tracklist]"
         if cover_url:
-            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [{parsed['album_type']}]{tag} [cover: {cover_source}]")
+            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [{parsed['album_type']}]{tag}{track_info} [cover: {cover_source}]")
         else:
-            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [{parsed['album_type']}]{tag} [no cover]")
+            print(f"   💾 {parsed['title']} ({parsed['release_year'] or 'N/A'}) [{parsed['album_type']}]{tag}{track_info} [no cover]")
 
         save_album(
             album_conn,
@@ -562,7 +681,9 @@ def fetch_albums_for_artist(artist_id: int, artist_name: str, album_conn):
             label=details['label'],
             producer=None,
             cover_url=cover_url,
-            cover_source=cover_source
+            cover_source=cover_source,
+            tracklist=tracklist,
+            tracklist_source=tracklist_source
         )
         new_albums += 1
 

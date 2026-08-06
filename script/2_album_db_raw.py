@@ -425,33 +425,42 @@ def get_artist_release_groups(artist_mbid: str, since_year: int = None) -> List[
 
 def get_official_release_details(release_group_mbid: str) -> Optional[Dict[str, Any]]:
     """
-    Look up ONE representative OFFICIAL release within a release-group, to
-    pull track count, label, AND the real ordered tracklist. Deliberately
-    skips bootleg/promotion-only editions — if a release-group has no
-    official release at all, we treat it as not a real canonical album and
-    return None (caller skips it). This is what keeps promos/bootlegs out
-    of the Album table at the source, instead of relying on downstream AI
-    matching to filter them.
+    Two-step lookup:
+      1. browse_releases() — lightweight, finds WHICH release within this
+         release-group is the official one (status filtering). This part
+         was already working correctly (total_tracks counts were fine).
+      2. get_release_by_id() — full detail LOOKUP on that specific release,
+         which is the documented way to get nested track/recording titles.
+         browse_releases() apparently doesn't reliably attach recording
+         titles even when 'recordings' is requested — browse is optimized
+         for lightweight listing, not deep nesting; lookup is the endpoint
+         meant for full single-entity detail. This was the actual bug
+         behind tracklist_json coming back NULL for every album.
 
-    The tracklist (song titles, in order) is what makes song-to-album
-    assignment downstream a simple membership check instead of an AI
-    guess for the common case — we're already paying for this API call
-    for total_tracks/label, 'recordings' just asks it to also include the
-    actual track titles in the same response, at no extra request cost.
+    Deliberately skips bootleg/promotion-only editions — if a release-group
+    has no official release at all, we treat it as not a real canonical
+    album and return None (caller skips it).
     """
     try:
-        result = musicbrainzngs.browse_releases(
+        browse_result = musicbrainzngs.browse_releases(
             release_group=release_group_mbid,
-            includes=['media', 'labels', 'recordings'],
+            includes=['media', 'labels'],
             limit=25
         )
-        releases = result.get('release-list', [])
+        releases = browse_result.get('release-list', [])
         official = [r for r in releases if r.get('status', '').lower() == 'official']
 
         if not official:
             return None
 
-        release = official[0]
+        release_id = official[0]['id']
+
+        # Full lookup on that one specific release for label + tracklist
+        lookup_result = musicbrainzngs.get_release_by_id(
+            release_id,
+            includes=['media', 'labels', 'recordings']
+        )
+        release = lookup_result.get('release', {})
 
         label_info = release.get('label-info-list', [])
         label = label_info[0].get('label', {}).get('name', '') if label_info else None

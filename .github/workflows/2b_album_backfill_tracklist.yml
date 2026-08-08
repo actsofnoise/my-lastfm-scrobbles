@@ -1,0 +1,37 @@
+name: 🔧 2b. Backfill Album Tracklists
+
+on:
+  workflow_dispatch:  # Manual trigger only — one-off maintenance run
+
+permissions:
+  contents: write  # Needed to commit/push the updated database
+
+jobs:
+  backfill-tracklists:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install musicbrainzngs requests
+
+      - name: 🔧 Run tracklist backfill
+        run: |
+          python script/2b_album_backfill_tracklist.py
+
+      - name: 💾 Commit and push updated database
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add data/2_albums_raw.db
+          git diff --staged --quiet || git commit -m "Backfill album tracklists [skip ci]"
+          git push

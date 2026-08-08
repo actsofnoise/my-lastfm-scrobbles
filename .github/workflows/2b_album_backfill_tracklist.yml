@@ -1,4 +1,4 @@
-name: 🔧 2b. Backfill Album Tracklists
+name: 2b. Backfill Album Tracklists [Manual]
 
 on:
   workflow_dispatch:  # Manual trigger only — one-off maintenance run

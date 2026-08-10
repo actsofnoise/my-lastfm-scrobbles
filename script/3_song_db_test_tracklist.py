@@ -1,67 +1,47 @@
 """
-Song Database - Raw Data Fetcher (TRACKLIST CACHE TEST v2 — limited to 100 new songs)
+Song Database - Raw Data Fetcher (DeepSeek China edition — near production)
 
-Experimental version that adds a TRACKLIST-CACHE layer as the FIRST album
-resolution strategy, ahead of the multi-AI voting system. Uses the real,
-ordered tracklists already stored in 2_albums_raw.db (tracklist_json column,
-populated by the updated 2_album_db_raw.py from MusicBrainz recordings /
-Wikipedia) — AND self-improves: every song the AI panel resolves gets
-written back into its album's cached tracklist, so it's never asked again.
+Uses the official DeepSeek China API (paid, effectively unlimited quota)
+for album/duration resolution, plus Gemini Flash and Gemma as supporting
+voters for album resolution.
 
-Why this matters: once ONE song from an album has been looked up, every
-OTHER song from that same album resolves INSTANTLY and for FREE — a simple
-membership check against a cached list, zero AI calls. This is exactly the
-King Crimson "Red" example: if "Red"'s tracklist is cached, "Starless"
-(track 5) matches immediately, no need to ask any model anything.
+NOTE: this used to run DeepSeek via NVIDIA's free-tier hosting, but NVIDIA
+dropped DeepSeek support, so this now talks to the official DeepSeek API
+directly. The filename still says "_nvidia" for now (matches the ongoing
+conversation/history); consider renaming once this fully replaces
+3_song_db_raw.py in production.
 
-SIX-TIER release priority (used consistently for cache tie-breaking AND in
-the AI voting prompt):
-    1. LP / Studio Album   2. EP   3. Single   4. Live
-    5. Compilation / Greatest Hits   6. Other (unrecognized types)
+Capped at MAX_NEW_SONGS per run for now — a controlled first run on the
+paid API before removing the cap.
 
-Resolution order per new song:
-    1. TRACKLIST CACHE
-       a. Exact match (normalized) against every known album's cached
-          tracklist for this artist.
-       b. If nothing exact, a FUZZY match pass (>=90% similarity) —
-          tolerates minor typos/transcription differences without risking
-          false positives on genuinely different songs.
-       c. If the title matches more than one cached album (e.g. same song
-          on both the studio album and a live album), tie-break by:
-          (i) album_from_scrobble — if Last.fm's own reported album name
-              matches one of the tied candidates, that one wins (free,
-              real signal); (ii) is_reissue; (iii) the six-tier type
-              priority above; (iv) earliest year.
-       -> 0 AI calls when this hits.
-    2. CLOSED-CANDIDATE MULTI-AI VOTING — only when the cache found
-       nothing at all.
-       a. DeepSeek (NVIDIA) votes first. A confident album/LP pick is
-          accepted directly (1 call).
-       b. Otherwise Gemma (the other PRIMARY voter) votes on the same
-          question. DeepSeek+Gemma agreeing (2/2) is accepted (2 calls).
-       c. Only if DeepSeek and Gemma DISAGREE does Gemini get called, as
-          a tiebreaker (Gemini has a very low daily quota, so it's
-          reserved for genuine disagreements, never used routinely).
-       d. If all three end up disagreeing, the song is left ambiguous /
-          id_album=0, with review_notes recording every model's vote —
-          never guessed.
-       e. FEEDBACK: any song the panel resolves gets appended to the
-          winning album's cached tracklist, both in memory (benefits the
-          rest of THIS run) and persisted to 2_albums_raw.db (benefits
-          every future run) — so the AI is never asked about that
-          album/song pair again.
-    3. Old scrobble/Last.fm/MusicBrainz fuzzy fallback — only when this
-       artist has literally no known albums yet.
+It retrieves:
+- Songs (id_artist, id_album, title, duration)
 
-This script is capped at MAX_NEW_SONGS new songs per run and writes to its
-own separate test database (data/3_songs_test_tracklist.db), so it never
-touches or risks corrupting the main pipeline's data/3_songs_raw.db while
-this strategy is being evaluated. If this performs well, this design gets
-ported into 3_song_db_raw_nvidia.py itself, and from there into the
-DeepSeek China production version (3_song_db_raw.py).
+Duration is fetched from:
+1. Last.fm API (primary)
+2. Spotify API (fallback 1 - optional)
+3. DeepSeek (official China API) (fallback 2 - AI)
 
-Duration fetching (Last.fm -> Spotify -> NVIDIA) is unchanged — this
-experiment is only about album resolution.
+Album is fetched using CLOSED-CANDIDATE multi-AI voting:
+1. Build the closed, numbered list of releases already known for this
+   artist in 2_albums_raw.db (NOT free-form generation — this is the key
+   fix: verifying against real candidates instead of asking a model to
+   invent an album name from memory, which is where demos/promos/
+   hallucinated rarities used to sneak in).
+2. Ask DeepSeek to pick a number from that list. If it picks a
+   genuine album/LP, accept directly (1 call, same cost as before).
+3. Otherwise (single/EP/greatest hits/live/none/unparseable) ESCALATE:
+   ask Gemini Flash and Gemma the exact same closed question.
+4. Majority vote (>=2 of 3) wins. If all three disagree, the song is left
+   as id_album=0 / album_source='ambiguous', with review_notes recording
+   what each model said — never guessed.
+5. Fallback chain (scrobble / Last.fm / MusicBrainz fuzzy matching) is
+   only used when this artist has NO known albums at all yet (nothing to
+   vote on) — never used to override a genuinely ambiguous vote.
+
+If the AI backend returns nothing (timeout, empty response, rate limit, etc.)
+the song is simply left as pending/id_album=0 and the script moves on to the
+next song — this is never treated as a fatal error.
 """
 
 import sqlite3
@@ -71,7 +51,6 @@ import requests
 import time
 import re
 import json
-import difflib
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 from dotenv import load_dotenv
@@ -84,7 +63,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install musicbrainzngs")
     import musicbrainzngs
 
-# Try to import the OpenAI client (used to talk to the NVIDIA-hosted endpoint)
+# Try to import the OpenAI client (used to talk to the DeepSeek API)
 try:
     from openai import OpenAI
 except ImportError:
@@ -106,40 +85,40 @@ load_dotenv()
 # Database paths
 ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '1_artist_genres.db')
 ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_albums_raw.db')
-# Separate TEST database — never touches the real data/3_songs_raw.db while
-# this tracklist-cache strategy is being evaluated.
-SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_songs_test_tracklist.db')
+SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_songs_raw.db')
 
-# Cap for this test run: stop after this many NEW songs have been
-# processed (songs that already existed and were skipped don't count).
-# None = no cap, process everything.
-MAX_NEW_SONGS = 192
+# Cap for this run: stop after this many NEW songs have been processed
+# (songs that already existed and were skipped don't count). This is the
+# first run against the paid, official DeepSeek API — capped for a
+# controlled validation before removing the limit. None = no cap.
+MAX_NEW_SONGS = 250
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
 LASTFM_USER = os.environ.get('LASTFM_USER')
 SPOTIFY_CLIENT_ID = os.environ.get('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.environ.get('SPOTIFY_CLIENT_SECRET')
-NVIDIA_API_KEY = os.environ.get('NVIDIA_API_KEY')
+DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
 SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
 SPOTIFY_API_URL = 'https://api.spotify.com/v1/search'
 
-NVIDIA_MODEL = "deepseek-ai/deepseek-v4-flash"
+# NVIDIA dropped DeepSeek support — this now talks to the official
+# DeepSeek China API directly (paid, but effectively unlimited quota,
+# unlike Gemini's very low daily free tier).
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 # NOTE: verify these two model strings are still current before relying on
 # this long-term — Google renames/retires Gemini model aliases often.
 GEMINI_MODEL = "gemini-3.6-flash"
 GEMMA_MODEL = "gemma-4-31b-it"
 
-# NVIDIA free tier can be slow (reasoning_effort=high), give it real room
-# before giving up on a single request.
-nvidia_client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_API_KEY or "missing",  # client requires a non-empty string
+deepseek_client = OpenAI(
+    base_url="https://api.deepseek.com",
+    api_key=DEEPSEEK_API_KEY or "missing",  # client requires a non-empty string
     timeout=120.0
-) if NVIDIA_API_KEY else None
+) if DEEPSEEK_API_KEY else None
 
 # genai.Client() reads GEMINI_API_KEY from the environment automatically.
 # Used for both Gemini and Gemma — they're just different model strings
@@ -160,19 +139,14 @@ spotify_token_expires = 0
 # Album AI lookup cache (avoid repeated DeepSeek calls for the same song in one run)
 album_ai_cache: Dict[str, Optional[dict]] = {}
 
-# Priority order when several album editions match: lower number = higher
-# priority. Six explicit tiers, agreed order:
-#   1. LP / Studio Album   2. EP   3. Single   4. Live
-#   5. Compilation/Greatest Hits   6. Other (anything unrecognized)
-# This SAME order is also what we tell the AI voting panel to follow.
+# Priority order when several album editions match: lower number = higher priority
 ALBUM_TYPE_PRIORITY = {
     'album': 0, 'lp': 0,
     'ep': 1,
     'single': 2,
-    'live': 3,
-    'greatest hits': 4, 'compilation': 4, 'best of': 4,
+    'greatest hits': 3, 'compilation': 3, 'best of': 3,
+    'live': 4
 }
-OTHER_TYPE_PRIORITY = 5  # default for anything not in the dict above ("Otro")
 
 
 # ============================================
@@ -252,7 +226,7 @@ def fetch_duration_from_spotify(artist_name: str, song_title: str) -> Optional[i
 
 
 # ============================================
-# NVIDIA API FUNCTIONS (DeepSeek V4 Flash, free tier)
+# DEEPSEEK API FUNCTIONS (official China API)
 # ============================================
 
 def is_suspicious_year_duration(duration: int) -> bool:
@@ -280,14 +254,14 @@ def is_suspicious_year_duration(duration: int) -> bool:
     return False
 
 
-def fetch_duration_from_nvidia(artist_name: str, song_title: str) -> Optional[int]:
-    """Fetch song duration using DeepSeek V4 Flash hosted on NVIDIA (free tier).
+def fetch_duration_from_deepseek(artist_name: str, song_title: str) -> Optional[int]:
+    """Fetch song duration using the official DeepSeek China API.
 
     On any failure (timeout, empty response, rate limit, malformed output)
     this simply returns None so the caller can move on to the next song —
     it is never treated as a fatal error.
     """
-    if not nvidia_client:
+    if not deepseek_client:
         return None
 
     try:
@@ -301,17 +275,15 @@ Do NOT respond with minutes:seconds format.
 Do NOT respond with a year (like 1973).
 If you don't know, respond with '0'."""
 
-        completion = nvidia_client.chat.completions.create(
-            model=NVIDIA_MODEL,
+        completion = deepseek_client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
             messages=[
                 {"role": "system", "content": "You are a music expert. Respond ONLY with a number (duration in seconds). Never respond with a year."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=1,
-            top_p=0.95,
-            max_tokens=16384,
-            extra_body={"chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}},
-            stream=False
+            stream=False,
+            reasoning_effort="high",
+            extra_body={"thinking": {"type": "enabled"}}
         )
 
         if not completion.choices:
@@ -326,7 +298,7 @@ If you don't know, respond with '0'."""
             duration = int(match.group())
 
             if is_suspicious_year_duration(duration):
-                print(f"      ⚠️ NVIDIA returned a year ({duration}s) instead of duration.")
+                print(f"      ⚠️ DeepSeek returned a year ({duration}s) instead of duration.")
                 return None
 
             if duration > 0 and duration < 6000:
@@ -335,7 +307,7 @@ If you don't know, respond with '0'."""
         return None
 
     except Exception as e:
-        print(f"      ⚠️ NVIDIA error for '{artist_name} - {song_title}': {e}")
+        print(f"      ⚠️ DeepSeek error for '{artist_name} - {song_title}': {e}")
         return None
 
 
@@ -415,131 +387,6 @@ def get_album_from_musicbrainz(artist_name: str, song_title: str) -> Optional[st
 # know about for that artist, and ask it to pick a number. This turns
 # "generate" into "verify", which these models are much better at.
 
-# ============================================
-# TRACKLIST CACHE (checked BEFORE any AI call)
-# ============================================
-#
-# 2_album_db_raw.py already stores the real, ordered tracklist for most
-# albums (from MusicBrainz recordings, or Wikipedia as fallback). Once one
-# song from an album has been resolved, every OTHER song from that same
-# album can be matched for free by simple membership check — no AI call
-# needed at all. This is the King Crimson "Red" case: if "Red"'s tracklist
-# is cached, "Starless" (track 5) matches instantly.
-
-_TRAILING_ANNOTATION_RE = re.compile(
-    r'\s*[\(\[]\s*(?:remaster(?:ed)?(?:\s*\d{4})?|mono|stereo|'
-    r'single version|album version|edit|bonus track)[^)\]]*[\)\]]\s*$',
-    re.IGNORECASE
-)
-
-
-def _normalize_song_for_match(title: str) -> str:
-    """Normalize a song title for tracklist membership comparison."""
-    t = (title or '').lower().strip()
-    # Strip trailing annotations that wouldn't appear in a canonical
-    # tracklist entry (e.g. "Starless (2004 Remaster)" -> "starless").
-    t = _TRAILING_ANNOTATION_RE.sub('', t)
-    t = re.sub(r'[^\w\s]', '', t)  # strip punctuation
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t
-
-
-FUZZY_MATCH_THRESHOLD = 0.90  # similarity ratio (0-1) for the tolerant second pass
-
-
-def _song_similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def find_song_in_tracklist_cache(song_title: str, album_map: Dict[int, List[dict]],
-                                  id_artist: int, album_from_scrobble: str = '') -> Tuple[int, Optional[str]]:
-    """
-    Check the song title against every cached tracklist for this artist's
-    known albums.
-
-    Two passes:
-      1. Exact match (after normalization) — cheap, no false positives.
-      2. Fuzzy match (>= FUZZY_MATCH_THRESHOLD similarity) — ONLY if pass 1
-         found nothing. Tolerates minor typos / transcription differences
-         in how a song title is written (e.g. in the scrobble vs. the
-         tracklist), without opening the door to matching genuinely
-         different songs.
-
-    If the title matches in more than one cached album (e.g. same song on
-    both the studio album and a live album), tie-break in this order:
-      a. album_from_scrobble — if Last.fm's own reported album name matches
-         one of the tied candidates, that one wins (it's free, real
-         signal from the actual scrobble, not a guess).
-      b. is_reissue (prefer the original, non-reissue edition)
-      c. Type priority — LP > EP > Single > Live > Compilation > Other
-      d. Earliest year
-
-    Returns (id_album, note) — note is None on an unambiguous exact match,
-    or a short explanation when fuzzy-matching or tie-breaking kicked in.
-    Returns (0, None) if nothing matches at all — caller falls through to
-    the AI voting system.
-    """
-    candidates = album_map.get(id_artist, [])
-    if not candidates:
-        return 0, None
-
-    target = _normalize_song_for_match(song_title)
-    if not target:
-        return 0, None
-
-    # Pass 1: exact match
-    matches = []
-    for c in candidates:
-        tracklist = c.get('tracklist')
-        if not tracklist:
-            continue
-        for track in tracklist:
-            if _normalize_song_for_match(track) == target:
-                matches.append(c)
-                break
-
-    fuzzy_used = False
-
-    # Pass 2: fuzzy match, only if pass 1 found nothing
-    if not matches:
-        best_ratio = 0.0
-        for c in candidates:
-            tracklist = c.get('tracklist')
-            if not tracklist:
-                continue
-            for track in tracklist:
-                ratio = _song_similarity(target, _normalize_song_for_match(track))
-                if ratio >= FUZZY_MATCH_THRESHOLD:
-                    matches.append(c)
-                    best_ratio = max(best_ratio, ratio)
-                    break
-        if matches:
-            fuzzy_used = True
-
-    if not matches:
-        return 0, None
-
-    note = f"Fuzzy match (>={FUZZY_MATCH_THRESHOLD:.0%} similarity)" if fuzzy_used else None
-
-    if len(matches) > 1:
-        # Tie-break (a): does the scrobble's own reported album match one of the tied candidates?
-        scrobble_norm = _normalize_song_for_match(album_from_scrobble) if album_from_scrobble else ''
-        if scrobble_norm:
-            scrobble_pick = next(
-                (c for c in matches if _normalize_song_for_match(c['title']) == scrobble_norm), None
-            )
-            if scrobble_pick:
-                tie_note = f"Matched in {len(matches)} cached tracklists, picked '{scrobble_pick['title']}' — confirmed by scrobble's own album tag"
-                return scrobble_pick['id_album'], (f"{note}. {tie_note}" if note else tie_note)
-
-        # Tie-break (b)(c)(d): is_reissue, then type priority, then year
-        matches.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], OTHER_TYPE_PRIORITY), c['year'] or 9999))
-        tie_note = f"Matched in {len(matches)} cached tracklists, picked '{matches[0]['title']}' by type-priority tiebreak"
-        note = f"{note}. {tie_note}" if note else tie_note
-
-    return matches[0]['id_album'], note
-
-
 def build_candidate_list(album_map: Dict[int, List[dict]], id_artist: int) -> List[dict]:
     """
     Build a deduplicated, sorted list of known releases for an artist.
@@ -560,7 +407,7 @@ def build_candidate_list(album_map: Dict[int, List[dict]], id_artist: int) -> Li
             seen.add(key)
             deduped.append(c)
 
-    deduped.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], OTHER_TYPE_PRIORITY), c['year'] or 9999))
+    deduped.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], 9), c['year'] or 9999))
     return deduped
 
 
@@ -586,7 +433,7 @@ Important rules:
 - If this song was released as a promotional single, demo, or advance preview shortly before/around one of these albums, it counts as belonging to THAT ALBUM's release — it is NOT a separate single, even if it was technically issued earlier as a promo.
 - Prefer the original release over a [reissue/remaster/deluxe] entry of the same album, when both are listed.
 - The oldest release is not automatically the correct answer — a later official album can still be the correct one if that's genuinely where the song belongs in the discography, while an earlier demo/promo of the same song is not.
-- If genuinely tied between types, prefer in this exact order: 1) Album (LP) 2) EP 3) Single 4) Live 5) Compilation/Greatest Hits 6) Other.
+- If genuinely tied between types, prefer in this order: Album (LP) > EP > Single > Greatest Hits > Live.
 
 Respond ONLY with the number of the correct option (for example: 3).
 If genuinely NONE of these releases is where the song belongs, respond with: 0
@@ -607,27 +454,25 @@ def _parse_choice(raw: Optional[str], n_candidates: int) -> Optional[int]:
 
 
 def _ask_deepseek_choice(prompt: str) -> Optional[str]:
-    """Ask DeepSeek (via NVIDIA) to pick a candidate number. Returns raw content or None."""
-    if not nvidia_client:
+    """Ask DeepSeek (official China API) to pick a candidate number. Returns raw content or None."""
+    if not deepseek_client:
         return None
     try:
-        completion = nvidia_client.chat.completions.create(
-            model=NVIDIA_MODEL,
+        completion = deepseek_client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
             messages=[
                 {"role": "system", "content": "You are a music discography expert. Respond ONLY with a number."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=1,
-            top_p=0.95,
-            max_tokens=16384,
-            extra_body={"chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}},
-            stream=False
+            stream=False,
+            reasoning_effort="high",
+            extra_body={"thinking": {"type": "enabled"}}
         )
         if not completion.choices:
             return None
         return completion.choices[0].message.content
     except Exception as e:
-        print(f"      ⚠️ DeepSeek (NVIDIA) voting error: {e}")
+        print(f"      ⚠️ DeepSeek voting error: {e}")
         return None
 
 
@@ -646,65 +491,20 @@ def _ask_gemini_family_choice(prompt: str, model: str) -> Optional[str]:
         return None
 
 
-def record_ai_resolution_in_cache(album_map: Dict[int, List[dict]], id_artist: int,
-                                   id_album: int, song_title: str):
-    """
-    Feedback loop: when the AI voting panel resolves a song, add it to the
-    winning album's cached tracklist — both in memory (so later songs in
-    THIS SAME RUN hit the cache immediately) and persisted back to
-    2_albums_raw.db (so future runs never have to ask the AI about this
-    album/song combination again). Without this, every song from an album
-    the AI resolves keeps costing AI calls forever, even after we've
-    effectively already learned the album's tracklist.
-    """
-    candidates = album_map.get(id_artist, [])
-    candidate = next((c for c in candidates if c['id_album'] == id_album), None)
-    if not candidate:
-        return
-
-    tracklist = candidate.get('tracklist') or []
-    normalized_existing = {_normalize_song_for_match(t) for t in tracklist}
-    if _normalize_song_for_match(song_title) in normalized_existing:
-        return  # already cached, nothing to do
-
-    tracklist = tracklist + [song_title]
-    candidate['tracklist'] = tracklist  # update in-memory copy immediately
-
-    try:
-        album_conn = sqlite3.connect(ALBUM_DB_PATH)
-        cursor = album_conn.cursor()
-        cursor.execute(
-            'UPDATE Album SET tracklist_json = ?, last_update = CURRENT_TIMESTAMP WHERE id_album = ?',
-            (json.dumps(tracklist, ensure_ascii=False), id_album)
-        )
-        album_conn.commit()
-        album_conn.close()
-    except Exception as e:
-        print(f"      ⚠️ Could not persist tracklist-cache feedback for id_album={id_album}: {e}")
-
-
 def resolve_album_multiai(artist_name: str, song_title: str,
                            album_map: Dict[int, List[dict]], id_artist: int) -> Tuple[int, str, Optional[str]]:
     """
     Resolve the album for a song using closed-candidate voting.
 
-    Voting panel, in order:
-        1. DeepSeek (NVIDIA) — if it confidently picks a genuine album/LP,
-           accepted directly (1 call total).
-        2. Otherwise, Gemma votes on the same closed question. If DeepSeek
-           and Gemma AGREE, accepted (2/2 majority, 2 calls total).
-        3. Only if DeepSeek and Gemma DISAGREE does Gemini get called, as
-           a tiebreaking third opinion (Gemini has a very low daily quota,
-           so it's reserved for genuine disagreements, not used on every
-           song). Whichever option then has >=2 of the 3 votes wins.
-        4. If all three end up disagreeing (or too many failed to answer),
-           the song is left ambiguous for manual review — never guessed.
-
     Returns (id_album, source, review_notes):
-        - source == 'nvidia'            -> DeepSeek alone, genuine album/LP.
-        - source == 'multiai-majority'  -> DeepSeek+Gemma agreed (2/2), or
-                                            Gemini broke the tie (2/3).
-        - source == 'ambiguous'         -> no agreement reached.
+        - source == 'deepseek'            -> DeepSeek alone answered with a
+                                            genuine album/LP pick, accepted
+                                            without escalating (1 call).
+        - source == 'multiai-majority'  -> escalated to Gemini + Gemma,
+                                            >=2 of 3 agreed.
+        - source == 'ambiguous'         -> escalated, all three disagreed;
+                                            id_album stays 0, review_notes
+                                            records what each model said.
         - source == 'no-candidates'     -> this artist has no known albums
                                             in 2_albums_raw.db at all, so
                                             there was nothing to vote on;
@@ -725,6 +525,10 @@ def resolve_album_multiai(artist_name: str, song_title: str,
 
     prompt = _format_candidate_prompt(artist_name, song_title, candidates)
 
+    # 1. Ask DeepSeek first (cheapest/fastest of the three in practice)
+    deepseek_raw = _ask_deepseek_choice(prompt)
+    deepseek_choice = _parse_choice(deepseek_raw, len(candidates))
+
     def _resolve(choice: Optional[int]) -> Tuple[int, Optional[str]]:
         """Map a 1-based choice to (id_album, type). 0/None -> (0, None)."""
         if choice and choice > 0:
@@ -732,46 +536,30 @@ def resolve_album_multiai(artist_name: str, song_title: str,
             return c['id_album'], c['type']
         return 0, None
 
-    # 1. Ask DeepSeek first
-    deepseek_raw = _ask_deepseek_choice(prompt)
-    deepseek_choice = _parse_choice(deepseek_raw, len(candidates))
     deepseek_id, deepseek_type = _resolve(deepseek_choice)
 
     # 2. Accept directly if DeepSeek confidently picked a genuine album/LP
     if deepseek_id and deepseek_type in ('album', 'lp'):
-        result = {'id_album': deepseek_id, 'source': 'nvidia', 'review_notes': None}
+        result = {'id_album': deepseek_id, 'source': 'deepseek', 'review_notes': None}
         album_ai_cache[cache_key] = result
-        record_ai_resolution_in_cache(album_map, id_artist, deepseek_id, song_title)
-        return deepseek_id, 'nvidia', None
+        return deepseek_id, 'deepseek', None
 
-    # 3. DeepSeek didn't land on a clear album -> ask Gemma (the other
-    #    primary voter; Gemini is NOT called yet)
+    # 3. Otherwise escalate: ask Gemini and Gemma the SAME closed question
+    time.sleep(0.3)
+    gemini_raw = _ask_gemini_family_choice(prompt, GEMINI_MODEL)
+    gemini_choice = _parse_choice(gemini_raw, len(candidates))
+
     time.sleep(0.3)
     gemma_raw = _ask_gemini_family_choice(prompt, GEMMA_MODEL)
     gemma_choice = _parse_choice(gemma_raw, len(candidates))
 
-    votes = {'deepseek': deepseek_choice, 'gemma': gemma_choice}
+    votes = {
+        'deepseek': deepseek_choice,
+        'gemini': gemini_choice,
+        'gemma': gemma_choice,
+    }
 
-    if deepseek_choice is not None and deepseek_choice == gemma_choice:
-        id_album, _ = _resolve(deepseek_choice)
-        note = f"DeepSeek+Gemma agreed (2/2) -> option {deepseek_choice}. Votes: {votes}"
-        if id_album:
-            result = {'id_album': id_album, 'source': 'multiai-majority', 'review_notes': note}
-            album_ai_cache[cache_key] = result
-            record_ai_resolution_in_cache(album_map, id_artist, id_album, song_title)
-            return id_album, 'multiai-majority', note
-        else:
-            note = f"DeepSeek+Gemma agreed (2/2) NONE apply. Votes: {votes}"
-            album_ai_cache[cache_key] = None
-            return 0, 'ambiguous', note
-
-    # 4. DeepSeek and Gemma disagree -> bring in Gemini as tiebreaker
-    #    (only reached on genuine disagreement, to conserve its low quota)
-    time.sleep(0.3)
-    gemini_raw = _ask_gemini_family_choice(prompt, GEMINI_MODEL)
-    gemini_choice = _parse_choice(gemini_raw, len(candidates))
-    votes['gemini'] = gemini_choice
-
+    # Tally: count agreement among the votes that were actually parseable
     valid_votes = [v for v in votes.values() if v is not None]
     tally: Dict[int, int] = {}
     for v in valid_votes:
@@ -781,19 +569,19 @@ def resolve_album_multiai(artist_name: str, song_title: str,
         best_choice, best_count = max(tally.items(), key=lambda kv: kv[1])
         if best_count >= 2:
             id_album, _ = _resolve(best_choice)
-            note = f"Gemini tiebreak, majority {best_count}/3 -> option {best_choice}. Votes: {votes}"
+            note = f"Majority {best_count}/3 -> option {best_choice}. Votes: {votes}"
             if id_album:
                 result = {'id_album': id_album, 'source': 'multiai-majority', 'review_notes': note}
                 album_ai_cache[cache_key] = result
-                record_ai_resolution_in_cache(album_map, id_artist, id_album, song_title)
                 return id_album, 'multiai-majority', note
             else:
-                note = f"Gemini tiebreak, majority {best_count}/3 agreed NONE apply. Votes: {votes}"
+                # Majority agreed on "none of these" (option 0)
+                note = f"Majority {best_count}/3 agreed NONE apply. Votes: {votes}"
                 album_ai_cache[cache_key] = None
                 return 0, 'ambiguous', note
 
-    # No majority even with Gemini's tiebreak: all three disagreed
-    note = f"No majority even with Gemini tiebreak — all disagreed or failed. Votes: {votes}"
+    # No majority: all three disagreed (or too many failed to answer at all)
+    note = f"No majority — all disagreed or failed. Votes: {votes}"
     album_ai_cache[cache_key] = None
     return 0, 'ambiguous', note
 
@@ -840,7 +628,7 @@ def find_album_in_db_smart(album_map: Dict[int, List[dict]], id_artist: int,
         if candidate_year:
             same_title.sort(key=lambda c: (c.get('is_reissue', False), abs((c['year'] or 9999) - candidate_year)))
         else:
-            same_title.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], OTHER_TYPE_PRIORITY)))
+            same_title.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], 9)))
         return same_title[0]['id_album']
 
     # 3. Fuzzy/partial title match, prefer non-reissue + original album type + earliest year
@@ -849,7 +637,7 @@ def find_album_in_db_smart(album_map: Dict[int, List[dict]], id_artist: int,
         if target in _normalize_title(c['title']) or _normalize_title(c['title']) in target
     ]
     if partial:
-        partial.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], OTHER_TYPE_PRIORITY), c['year'] or 9999))
+        partial.sort(key=lambda c: (c.get('is_reissue', False), ALBUM_TYPE_PRIORITY.get(c['type'], 9), c['year'] or 9999))
         return partial[0]['id_album']
 
     return 0
@@ -858,26 +646,17 @@ def find_album_in_db_smart(album_map: Dict[int, List[dict]], id_artist: int,
 def find_album_for_song(artist_name: str, song_title: str, album_from_scrobble: str,
                          album_map: Dict[int, List[dict]], id_artist: int) -> Tuple[int, str, Optional[str]]:
     """
-    Find album ID for a song using, in order:
-      1. Tracklist cache — free membership check against real tracklists
-         already stored in 2_albums_raw.db. Zero AI calls when it hits.
-      2. Closed-candidate multi-AI voting (see resolve_album_multiai).
-      3. Old scrobble/Last.fm/MusicBrainz fuzzy-matching chain — ONLY when
-         this artist has no known albums at all (nothing to check/vote on).
-
-    A genuinely ambiguous multi-AI vote is NEVER overridden by fuzzy
-    matching — that's a real "needs review" signal, not a reason to fall
-    back to weaker matching.
+    Find album ID for a song using closed-candidate multi-AI voting as the
+    primary strategy (see resolve_album_multiai). Falls back to the old
+    scrobble/Last.fm/MusicBrainz fuzzy-matching chain ONLY when this artist
+    has no known albums at all in 2_albums_raw.db (nothing to vote on) —
+    NOT when the vote came back ambiguous (that's a real "needs review"
+    signal, not a reason to fall back to weaker fuzzy matching).
 
     Returns (id_album, source, review_notes).
-    Sources: 'tracklist-cache', 'nvidia', 'multiai-majority', 'ambiguous',
+    Sources: 'deepseek', 'multiai-majority', 'ambiguous',
              'scrobble', 'lastfm', 'musicbrainz', 'none'
     """
-    # 1. Tracklist cache — check first, it's free and it's ground truth
-    id_album, note = find_song_in_tracklist_cache(song_title, album_map, id_artist, album_from_scrobble)
-    if id_album > 0:
-        return id_album, 'tracklist-cache', note
-
     id_album, source, review_notes = resolve_album_multiai(artist_name, song_title, album_map, id_artist)
 
     if source != 'no-candidates':
@@ -1007,18 +786,14 @@ def load_artist_map() -> dict:
 def load_album_map() -> Dict[int, List[dict]]:
     """
     Loads all albums into memory as:
-    {id_artist: [ {title, year, type, is_reissue, tracklist, id_album}, ... ]}
+    {id_artist: [ {title, year, type, is_reissue, id_album}, ... ]}
 
     Loading release_year and album_type (not just title) is what lets
     find_album_in_db_smart tell apart the original 1973 release from a
-    2010 remaster of the same title. is_reissue adds an explicit
-    tiebreaker so remasters/deluxe/anniversary editions are only picked
-    over the original when nothing else distinguishes them.
-
-    tracklist (parsed from tracklist_json, when the column exists — added
-    by the updated 2_album_db_raw.py) is what powers the tracklist-cache
-    lookup: a simple membership check against real, verified track titles,
-    resolved for free without any AI call.
+    2010 remaster of the same title. is_reissue (when the column exists —
+    added by the updated 2_album_db_raw.py) adds an explicit tiebreaker so
+    remasters/deluxe/anniversary editions are only picked over the
+    original when nothing else distinguishes them.
     (No JOIN with Artist to avoid cross-database issues.)
     """
     album_conn = sqlite3.connect(ALBUM_DB_PATH)
@@ -1027,34 +802,26 @@ def load_album_map() -> Dict[int, List[dict]]:
     cursor.execute("PRAGMA table_info(Album)")
     columns = {row[1] for row in cursor.fetchall()}
     has_is_reissue = 'is_reissue' in columns
-    has_tracklist = 'tracklist_json' in columns
 
-    select_cols = ['id_artist', 'title', 'release_year', 'album_type', 'id_album']
     if has_is_reissue:
-        select_cols.insert(4, 'is_reissue')
-    if has_tracklist:
-        select_cols.append('tracklist_json')
-
-    cursor.execute(f"SELECT {', '.join(select_cols)} FROM Album")
+        cursor.execute('SELECT id_artist, title, release_year, album_type, is_reissue, id_album FROM Album')
+    else:
+        cursor.execute('SELECT id_artist, title, release_year, album_type, id_album FROM Album')
 
     album_map: Dict[int, List[dict]] = {}
     for row in cursor.fetchall():
-        row_dict = dict(zip(select_cols, row))
+        if has_is_reissue:
+            id_artist, title, release_year, album_type, is_reissue, id_album = row
+        else:
+            id_artist, title, release_year, album_type, id_album = row
+            is_reissue = 0
 
-        tracklist = None
-        if has_tracklist and row_dict.get('tracklist_json'):
-            try:
-                tracklist = json.loads(row_dict['tracklist_json'])
-            except (json.JSONDecodeError, TypeError):
-                tracklist = None
-
-        album_map.setdefault(row_dict['id_artist'], []).append({
-            'title': row_dict['title'],
-            'year': row_dict['release_year'],
-            'type': (row_dict['album_type'] or '').strip().lower(),
-            'is_reissue': bool(row_dict.get('is_reissue', 0)),
-            'tracklist': tracklist,
-            'id_album': row_dict['id_album']
+        album_map.setdefault(id_artist, []).append({
+            'title': title,
+            'year': release_year,
+            'type': (album_type or '').strip().lower(),
+            'is_reissue': bool(is_reissue),
+            'id_album': id_album
         })
 
     album_conn.close()
@@ -1162,7 +929,7 @@ def fetch_duration_from_lastfm(artist_name: str, song_title: str) -> Optional[in
 
 
 def fetch_duration_with_fallback(artist_name: str, song_title: str) -> Tuple[Optional[int], str]:
-    """Fetch duration using: Last.fm -> Spotify -> NVIDIA (DeepSeek V4 Flash)"""
+    """Fetch duration using: Last.fm -> Spotify -> DeepSeek (official China API)"""
     
     # 1. Try Last.fm
     duration = fetch_duration_from_lastfm(artist_name, song_title)
@@ -1174,10 +941,10 @@ def fetch_duration_with_fallback(artist_name: str, song_title: str) -> Tuple[Opt
     if duration:
         return duration, 'spotify'
 
-    # 3. Try NVIDIA (free tier AI, slower and more prone to empty responses)
-    duration = fetch_duration_from_nvidia(artist_name, song_title)
+    # 3. Try DeepSeek (official China API)
+    duration = fetch_duration_from_deepseek(artist_name, song_title)
     if duration:
-        return duration, 'nvidia'
+        return duration, 'deepseek'
 
     return None, 'pending'
 
@@ -1277,15 +1044,14 @@ def process_scrobble(conn, scrobble_data, artist_map: dict, album_map: dict,
     save_song(conn, id_artist, id_album, song_title, duration, duration_source,
               retry_count, album_retry_count, album_source, review_notes)
 
-    # Rate limiting: NVIDIA's free tier is slow and easier to rate-limit,
-    # so it gets a longer pause than the cheap/fast sources. Tracklist-cache
-    # hits made zero AI calls, so they get zero extra delay.
-    if duration_source == 'nvidia':
+    # Rate limiting: be reasonably polite to the DeepSeek API,
+    # so it gets a longer pause than the cheap/fast sources.
+    if duration_source == 'deepseek':
         time.sleep(1.5)
     elif duration_source in ('spotify', 'pending'):
         time.sleep(0.5)
 
-    if album_source == 'nvidia':
+    if album_source == 'deepseek':
         time.sleep(1.5)
     elif album_source in ('multiai-majority', 'ambiguous'):
         # Already made 3 AI calls (deepseek + gemini + gemma) resolving this one
@@ -1333,7 +1099,7 @@ def retry_pending_songs(conn, artist_map: dict, album_map: dict, artist_name_cac
                 ''', (id_song,))
                 conn.commit()
             
-            if source == 'nvidia':
+            if source == 'deepseek':
                 time.sleep(1.5)
             elif source in ('spotify', 'pending'):
                 time.sleep(0.5)
@@ -1384,7 +1150,7 @@ def retry_album_songs(conn, artist_map: dict, album_map: dict, artist_name_cache
             ''', (id_song,))
             conn.commit()
         
-        if album_source == 'nvidia':
+        if album_source == 'deepseek':
             time.sleep(1.5)
         elif album_source in ('multiai-majority', 'ambiguous'):
             time.sleep(2.0)
@@ -1426,9 +1192,7 @@ def fetch_all_scrobbles(conn, limit: int = 200):
     cap_reached = False
 
     if MAX_NEW_SONGS is not None:
-        print(f"🧪 TEST RUN — capped at {MAX_NEW_SONGS} new songs")
-    else:
-        print("🧪 TEST RUN — no cap, processing all scrobbles")
+        print(f"🎯 Capped at {MAX_NEW_SONGS} new songs for this run")
 
     while True:
         print(f"📄 Fetching page {page}...")
@@ -1454,7 +1218,7 @@ def fetch_all_scrobbles(conn, limit: int = 200):
                 new_songs_count += 1
 
             if MAX_NEW_SONGS is not None and new_songs_count >= MAX_NEW_SONGS:
-                print(f"\n🛑 Reached the {MAX_NEW_SONGS}-new-song cap for this test run. Stopping.")
+                print(f"\n🛑 Reached the {MAX_NEW_SONGS}-new-song cap for this run. Stopping.")
                 cap_reached = True
                 break
 
@@ -1477,7 +1241,7 @@ def fetch_all_scrobbles(conn, limit: int = 200):
         print("\n🔄 Retrying songs without album...")
         retry_album_songs(conn, artist_map, album_map, artist_name_cache)
     else:
-        print("\n⏭️  Skipping retry passes — new-song cap already reached for this test run.")
+        print("\n⏭️  Skipping retry passes — new-song cap already reached for this run.")
 
     now = datetime.now().isoformat()
     set_last_update_time(conn, now)
@@ -1503,7 +1267,7 @@ def get_stats(conn):
     cursor.execute('SELECT duration_source, COUNT(*) FROM Song WHERE duration IS NOT NULL GROUP BY duration_source')
     duration_sources = cursor.fetchall()
 
-    cursor.execute('SELECT album_source, COUNT(*) FROM Song GROUP BY album_source')
+    cursor.execute('SELECT album_source, COUNT(*) FROM Song WHERE id_album > 0 GROUP BY album_source')
     album_sources = cursor.fetchall()
 
     cursor.execute('SELECT SUM(duration) FROM Song')
@@ -1521,9 +1285,9 @@ def get_stats(conn):
 
 
 def create_database():
+    cap_label = f"capped at {MAX_NEW_SONGS} new songs" if MAX_NEW_SONGS is not None else "no cap"
     print("=" * 60)
-    cap_label = f"capped at {MAX_NEW_SONGS} new songs" if MAX_NEW_SONGS is not None else "no cap — full run"
-    print(f"SONG DATABASE - TRACKLIST CACHE TEST ({cap_label})")
+    print(f"SONG DATABASE - RAW DATA FETCHER (DeepSeek China edition, {cap_label})")
     print("=" * 60)
 
     if not LASTFM_API_KEY or not LASTFM_USER:
@@ -1540,8 +1304,8 @@ def create_database():
         print("   Running without album mapping. id_album will be set to 0.")
         print("   (Run 2_album_db_raw.py first for full album support)")
 
-    if not nvidia_client:
-        print("⚠️ NVIDIA_API_KEY not found in environment variables.")
+    if not deepseek_client:
+        print("⚠️ DEEPSEEK_API_KEY not found in environment variables.")
         print("   AI-based duration/album lookups will be skipped (songs stay pending/id_album=0).")
 
     os.makedirs(os.path.dirname(SONG_DB_PATH), exist_ok=True)

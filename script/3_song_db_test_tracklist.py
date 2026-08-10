@@ -110,9 +110,11 @@ ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data',
 # this tracklist-cache strategy is being evaluated.
 SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_songs_test_tracklist.db')
 
-# Hard cap for this test run: stop after this many NEW songs have been
+# Cap for this test run: stop after this many NEW songs have been
 # processed (songs that already existed and were skipped don't count).
-MAX_NEW_SONGS = 100
+# None = no cap, process everything — used now that the design has been
+# validated on a 100-song sample and we're testing at full scale.
+MAX_NEW_SONGS = None
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -1422,8 +1424,12 @@ def fetch_all_scrobbles(conn, limit: int = 200):
     page = 1
     total_processed = 0
     new_songs_count = 0
+    cap_reached = False
 
-    print(f"🧪 TEST RUN — capped at {MAX_NEW_SONGS} new songs")
+    if MAX_NEW_SONGS is not None:
+        print(f"🧪 TEST RUN — capped at {MAX_NEW_SONGS} new songs")
+    else:
+        print("🧪 TEST RUN — no cap, processing all scrobbles")
 
     while True:
         print(f"📄 Fetching page {page}...")
@@ -1448,13 +1454,15 @@ def fetch_all_scrobbles(conn, limit: int = 200):
             if was_new:
                 new_songs_count += 1
 
-            if new_songs_count >= MAX_NEW_SONGS:
+            if MAX_NEW_SONGS is not None and new_songs_count >= MAX_NEW_SONGS:
                 print(f"\n🛑 Reached the {MAX_NEW_SONGS}-new-song cap for this test run. Stopping.")
+                cap_reached = True
                 break
 
-        print(f"   ✅ Page {page}/{total_pages} processed. New songs so far: {new_songs_count}/{MAX_NEW_SONGS}")
+        progress = f"{new_songs_count}/{MAX_NEW_SONGS}" if MAX_NEW_SONGS is not None else str(new_songs_count)
+        print(f"   ✅ Page {page}/{total_pages} processed. New songs so far: {progress}")
 
-        if new_songs_count >= MAX_NEW_SONGS:
+        if cap_reached:
             break
 
         if page >= total_pages:
@@ -1463,7 +1471,7 @@ def fetch_all_scrobbles(conn, limit: int = 200):
         page += 1
         time.sleep(0.3)
 
-    if new_songs_count < MAX_NEW_SONGS:
+    if not cap_reached:
         print("\n🔄 Retrying pending duration songs...")
         retry_pending_songs(conn, artist_map, album_map, artist_name_cache)
 
@@ -1515,7 +1523,8 @@ def get_stats(conn):
 
 def create_database():
     print("=" * 60)
-    print(f"SONG DATABASE - TRACKLIST CACHE TEST (capped at {MAX_NEW_SONGS} new songs)")
+    cap_label = f"capped at {MAX_NEW_SONGS} new songs" if MAX_NEW_SONGS is not None else "no cap — full run"
+    print(f"SONG DATABASE - TRACKLIST CACHE TEST ({cap_label})")
     print("=" * 60)
 
     if not LASTFM_API_KEY or not LASTFM_USER:

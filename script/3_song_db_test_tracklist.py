@@ -113,7 +113,7 @@ SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 
 # Cap for this test run: stop after this many NEW songs have been
 # processed (songs that already existed and were skipped don't count).
 # None = no cap, process everything.
-MAX_NEW_SONGS = 120
+MAX_NEW_SONGS = 140
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')

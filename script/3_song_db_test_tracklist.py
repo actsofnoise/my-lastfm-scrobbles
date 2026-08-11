@@ -91,7 +91,7 @@ SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 
 # (songs that already existed and were skipped don't count). This is the
 # first run against the paid, official DeepSeek API — capped for a
 # controlled validation before removing the limit. None = no cap.
-MAX_NEW_SONGS = 250
+MAX_NEW_SONGS = 50
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')

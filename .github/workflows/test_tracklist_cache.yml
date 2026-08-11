@@ -1,13 +1,13 @@
-name: 🧪 Test - Tracklist Cache (100 songs)
+name: 3b. Update Songs (DeepSeek + Gemma + Groq — 150 songs)
 
 on:
-  workflow_dispatch:  # Manual trigger only — this is a bounded test run
+  workflow_dispatch:  # Manual trigger — controlled test run
 
 permissions:
-  contents: write  # Commits the resulting test DB so you can inspect it afterward
+  contents: write
 
 jobs:
-  test-tracklist-cache:
+  update-songs:
     runs-on: ubuntu-latest
 
     steps:
@@ -27,21 +27,22 @@ jobs:
       - name: 📁 Create data directory
         run: mkdir -p data
 
-      - name: 🧪 Run tracklist-cache test (100 songs)
+      - name: 🎵 Run song database update
         env:
           LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
           LASTFM_USER: ${{ secrets.LASTFM_USER }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          python script/3_song_db_test_tracklist.py
+          python script/3_song_db_raw_nvidia.py
 
-      - name: 💾 Commit and push test database
+      - name: 💾 Commit and push database
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add data/3_songs_test_tracklist.db
-          git diff --staged --quiet || git commit -m "Test run: tracklist-cache strategy (100 songs) [skip ci]"
+          git add data/3_songs_raw.db
+          git diff --staged --quiet || git commit -m "Actualizar 3_songs_raw.db (DeepSeek+Gemma+Groq, 150) [skip ci]"
           git push

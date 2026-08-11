@@ -1,4 +1,4 @@
-name: 3b. Update Songs (DeepSeek + Gemma + Groq — 150 songs)
+name:  (test) Update Songs (DeepSeek + Gemma + Groq — 150 songs)
 
 on:
   workflow_dispatch:  # Manual trigger — controlled test run

@@ -92,7 +92,7 @@ SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 
 # (songs that already existed and were skipped don't count). This is the
 # first run against the paid, official DeepSeek API — capped for a
 # controlled validation before removing the limit. None = no cap.
-MAX_NEW_SONGS = 50
+MAX_NEW_SONGS = 10
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -120,7 +120,7 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 deepseek_client = OpenAI(
     base_url="https://api.deepseek.com",
     api_key=DEEPSEEK_API_KEY or "missing",
-    timeout=30.0
+    timeout=20.0
 ) if DEEPSEEK_API_KEY else None
 
 # genai.Client() reads GEMINI_API_KEY from the environment automatically.
@@ -132,7 +132,7 @@ genai_client = genai.Client() if GEMINI_API_KEY else None
 groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY or "missing",
-    timeout=30.0
+    timeout=20.0
 ) if GROQ_API_KEY else None
 
 # Configure MusicBrainz

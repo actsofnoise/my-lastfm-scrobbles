@@ -92,7 +92,7 @@ SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 
 # (songs that already existed and were skipped don't count). This is the
 # first run against the paid, official DeepSeek API — capped for a
 # controlled validation before removing the limit. None = no cap.
-MAX_NEW_SONGS = 50
+MAX_NEW_SONGS = 150
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -478,7 +478,11 @@ No explanation, no extra text — just the number."""
 def _parse_choice(raw: Optional[str], n_candidates: int) -> Optional[int]:
     """Parse a numeric answer. Returns 0 (explicit 'none'), 1..n (a candidate), or None (unparseable)."""
     if not raw:
+        print(f"      [raw response]: (empty/None)")
         return None
+    # Log the raw response so we can see exactly what each model is saying
+    raw_preview = raw.strip().replace('\n', ' ')[:80]
+    print(f"      [raw response]: '{raw_preview}'")
     match = re.search(r'\d+', raw)
     if not match:
         return None
@@ -587,6 +591,13 @@ def resolve_album_multiai(artist_name: str, song_title: str,
         return cached['id_album'], cached['source'], cached.get('review_notes')
 
     prompt = _format_candidate_prompt(artist_name, song_title, candidates)
+
+    # Diagnostic: log candidate count so we can see what the models are working with
+    print(f"      [voting] {len(candidates)} candidates for '{artist_name}':")
+    for i, c in enumerate(candidates[:5], 1):
+        print(f"        {i}. {c['title']} ({c['year']}) [{c['type']}]")
+    if len(candidates) > 5:
+        print(f"        ... and {len(candidates) - 5} more")
 
     def _resolve(choice: Optional[int]) -> Tuple[int, Optional[str]]:
         """Map a 1-based choice to (id_album, type). 0/None -> (0, None)."""

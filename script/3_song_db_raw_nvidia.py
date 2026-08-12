@@ -51,6 +51,7 @@ import requests
 import time
 import re
 import json
+import signal
 from datetime import datetime
 from typing import Optional, Tuple, Dict, List
 from dotenv import load_dotenv
@@ -91,7 +92,7 @@ SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 
 # (songs that already existed and were skipped don't count). This is the
 # first run against the paid, official DeepSeek API — capped for a
 # controlled validation before removing the limit. None = no cap.
-MAX_NEW_SONGS = 150
+MAX_NEW_SONGS = 50
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -119,7 +120,7 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 deepseek_client = OpenAI(
     base_url="https://api.deepseek.com",
     api_key=DEEPSEEK_API_KEY or "missing",
-    timeout=120.0
+    timeout=30.0
 ) if DEEPSEEK_API_KEY else None
 
 # genai.Client() reads GEMINI_API_KEY from the environment automatically.
@@ -131,7 +132,7 @@ genai_client = genai.Client() if GEMINI_API_KEY else None
 groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY or "missing",
-    timeout=60.0
+    timeout=20.0
 ) if GROQ_API_KEY else None
 
 # Configure MusicBrainz
@@ -147,6 +148,32 @@ spotify_token_expires = 0
 
 # Album AI lookup cache (avoid repeated DeepSeek calls for the same song in one run)
 album_ai_cache: Dict[str, Optional[dict]] = {}
+
+
+class AITimeoutError(Exception):
+    pass
+
+
+def _ai_timeout_handler(signum, frame):
+    raise AITimeoutError("AI call timed out after 30s")
+
+
+class ai_time_limit:
+    """Context manager: raises AITimeoutError if the block takes > seconds.
+    Uses SIGALRM, only available on Linux/macOS (not Windows) — GitHub
+    Actions runners run on Ubuntu so this is safe for our CI pipeline.
+    """
+    def __init__(self, seconds: int = 30):
+        self.seconds = seconds
+
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, _ai_timeout_handler)
+        signal.alarm(self.seconds)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        signal.alarm(0)  # cancel the alarm regardless of outcome
+        return False  # don't suppress any exception
 
 # Priority order when several album editions match: lower number = higher priority
 ALBUM_TYPE_PRIORITY = {
@@ -291,8 +318,7 @@ If you don't know, respond with '0'."""
                 {"role": "user", "content": prompt}
             ],
             stream=False,
-            reasoning_effort="high",
-            extra_body={"thinking": {"type": "enabled"}}
+            max_tokens=20
         )
 
         if not completion.choices:
@@ -474,8 +500,7 @@ def _ask_deepseek_choice(prompt: str) -> Optional[str]:
                 {"role": "user", "content": prompt}
             ],
             stream=False,
-            reasoning_effort="high",
-            extra_body={"thinking": {"type": "enabled"}}
+            max_tokens=10
         )
         if not completion.choices:
             return None
@@ -490,9 +515,13 @@ def _ask_gemini_family_choice(prompt: str, model: str) -> Optional[str]:
     if not genai_client:
         return None
     try:
+        from google.genai import types as genai_types
         response = genai_client.models.generate_content(
             model=model,
             contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=50,
+            )
         )
         return response.text
     except Exception as e:
@@ -514,7 +543,8 @@ def _ask_groq_choice(prompt: str) -> Optional[str]:
                 {"role": "system", "content": "You are a music discography expert. Respond ONLY with a number."},
                 {"role": "user", "content": prompt}
             ],
-            stream=False
+            stream=False,
+            max_tokens=50
         )
         if not completion.choices:
             return None
@@ -693,21 +723,26 @@ def find_album_for_song(artist_name: str, song_title: str, album_from_scrobble: 
                          album_map: Dict[int, List[dict]], id_artist: int) -> Tuple[int, str, Optional[str]]:
     """
     Find album ID for a song using closed-candidate multi-AI voting as the
-    primary strategy (see resolve_album_multiai). Falls back to the old
-    scrobble/Last.fm/MusicBrainz fuzzy-matching chain ONLY when this artist
-    has no known albums at all in 2_albums_raw.db (nothing to vote on) —
-    NOT when the vote came back ambiguous (that's a real "needs review"
-    signal, not a reason to fall back to weaker fuzzy matching).
+    primary strategy (see resolve_album_multiai). Hard time limit of 30s
+    on the AI voting block — if all three models together take more than
+    30s, the song is left as pending rather than blocking the whole run.
+    Falls back to the old scrobble/Last.fm/MusicBrainz fuzzy-matching
+    chain ONLY when this artist has no known albums at all.
 
     Returns (id_album, source, review_notes).
     Sources: 'deepseek', 'multiai-majority', 'ambiguous',
              'scrobble', 'lastfm', 'musicbrainz', 'none'
     """
-    id_album, source, review_notes = resolve_album_multiai(artist_name, song_title, album_map, id_artist)
+    try:
+        with ai_time_limit(30):
+            id_album, source, review_notes = resolve_album_multiai(
+                artist_name, song_title, album_map, id_artist
+            )
+    except AITimeoutError:
+        print(f"      ⏱️ AI voting timed out after 30s — leaving as pending")
+        return 0, 'ambiguous', 'AI voting timed out after 30s'
 
     if source != 'no-candidates':
-        # Either resolved (nvidia / multiai-majority) or genuinely ambiguous —
-        # in both cases we're done, no fuzzy-matching fallback.
         return id_album, source, review_notes
 
     # No known albums for this artist at all yet — fall back to the old

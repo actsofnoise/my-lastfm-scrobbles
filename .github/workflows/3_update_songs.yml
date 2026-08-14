@@ -1,13 +1,10 @@
-name: 3. Update Songs from Last.fm
+name: 3b. Update Songs (DeepSeek + Gemma + Groq — test)
 
 on:
-  schedule:
-    # Run daily at 5:45 AM UTC (after albums update)
-    # - cron: '45 5 * * *'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:  # Manual trigger — controlled test run
 
 permissions:
-  contents: write  # Needed to commit/push the updated database
+  contents: write
 
 jobs:
   update-songs:
@@ -37,20 +34,15 @@ jobs:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          python script/3_song_db_raw.py
-
-      - name: 📤 Upload song database as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: songs-database-raw
-          path: data/3_songs_raw.db
-          retention-days: 7
+          python script/3_song_db_final.py
 
       - name: 💾 Commit and push database
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add data/3_songs_raw.db
-          git diff --staged --quiet || git commit -m "Actualizar 3_songs_raw.db con canciones de Last.fm [skip ci]"
+          git add data/3_songs_test_tracklist.db
+          git diff --staged --quiet || git commit -m "Actualizar 3_songs_test_tracklist.db [skip ci]"
           git push

@@ -35,7 +35,7 @@ Resolution order per new song:
        -> 0 AI calls when this hits.
     2. CLOSED-CANDIDATE MULTI-AI VOTING — only when the cache found
        nothing at all.
-       a. DeepSeek (Official API) votes first. A confident album/LP pick is
+       a. DeepSeek (China API) votes first. A confident album/LP pick is
           accepted directly (1 call).
        b. Otherwise Gemma (the other PRIMARY voter) votes on the same
           question. DeepSeek+Gemma agreeing (2/2) is accepted (2 calls).
@@ -58,9 +58,9 @@ own separate test database (data/3_songs_test_tracklist.db), so it never
 touches or risks corrupting the main pipeline's data/3_songs_raw.db while
 this strategy is being evaluated. If this performs well, this design gets
 ported into 3_song_db_raw_nvidia.py itself, and from there into the
-DeepSeek production version (3_song_db_raw.py).
+DeepSeek China production version (3_song_db_raw.py).
 
-Duration fetching (Last.fm -> Spotify -> DeepSeek) is unchanged — this
+Duration fetching (Last.fm -> Spotify -> DeepSeek China) is unchanged — this
 experiment is only about album resolution.
 """
 
@@ -84,7 +84,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install musicbrainzngs")
     import musicbrainzngs
 
-# Try to import the OpenAI client (used for DeepSeek API and Groq)
+# Try to import the OpenAI client (used for DeepSeek China API and Groq)
 try:
     from openai import OpenAI
 except ImportError:
@@ -108,7 +108,7 @@ ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data'
 ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_albums_raw.db')
 SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_song_db_raw.db')
 
-MAX_NEW_SONGS = 23
+MAX_NEW_SONGS = 63
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -124,13 +124,13 @@ LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
 SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
 SPOTIFY_API_URL = 'https://api.spotify.com/v1/search'
 
-# DeepSeek (official API, paid/unlimited) replaces NVIDIA-hosted DeepSeek
-DEEPSEEK_MODEL = "deepseek-chat"   # deepseek-v4-flash on API
+# DeepSeek China (official API, paid/unlimited) replaces NVIDIA-hosted DeepSeek
+DEEPSEEK_MODEL = "deepseek-chat"   # deepseek-v4-flash on China API
 GEMMA_MODEL = "gemma-4-31b-it"
 # Groq replaces Gemini Flash (which had only 16 RPD — too low for production)
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-# DeepSeek — same OpenAI-compatible SDK, different base_url
+# DeepSeek China — same OpenAI-compatible SDK, different base_url
 deepseek_client = OpenAI(
     base_url="https://api.deepseek.com",
     api_key=DEEPSEEK_API_KEY or "missing",
@@ -256,7 +256,7 @@ def fetch_duration_from_spotify(artist_name: str, song_title: str) -> Optional[i
 
 
 # ============================================
-# DEEPSEEK API FUNCTIONS
+# DEEPSEEK CHINA API FUNCTIONS
 # ============================================
 
 def is_suspicious_year_duration(duration: int) -> bool:
@@ -285,7 +285,7 @@ def is_suspicious_year_duration(duration: int) -> bool:
 
 
 def fetch_duration_from_deepseek(artist_name: str, song_title: str) -> Optional[int]:
-    """Fetch song duration using the official DeepSeek API.
+    """Fetch song duration using the official DeepSeek China API.
 
     On any failure (timeout, empty response, rate limit, malformed output)
     this simply returns None so the caller can move on to the next song —
@@ -608,7 +608,7 @@ def _parse_choice(raw: Optional[str], n_candidates: int) -> Optional[int]:
 
 
 def _ask_deepseek_choice(prompt: str) -> Optional[str]:
-    """Ask DeepSeek API to pick a candidate number. Returns raw content or None."""
+    """Ask DeepSeek China API to pick a candidate number. Returns raw content or None."""
     if not deepseek_client:
         return None
     try:
@@ -712,7 +712,7 @@ def resolve_album_multiai(artist_name: str, song_title: str,
     Resolve the album for a song using closed-candidate voting.
 
     Voting panel, in order:
-        1. DeepSeek (API) — if it confidently picks a genuine album/LP,
+        1. DeepSeek (China API) — if it confidently picks a genuine album/LP,
            accepted directly (1 call total).
         2. Otherwise, Gemma votes on the same closed question. If DeepSeek
            and Gemma AGREE, accepted (2/2 majority, 2 calls total).
@@ -1185,7 +1185,7 @@ def fetch_duration_from_lastfm(artist_name: str, song_title: str) -> Optional[in
 
 
 def fetch_duration_with_fallback(artist_name: str, song_title: str) -> Tuple[Optional[int], str]:
-    """Fetch duration using: Last.fm -> Spotify -> DeepSeek"""
+    """Fetch duration using: Last.fm -> Spotify -> DeepSeek China"""
     
     # 1. Try Last.fm
     duration = fetch_duration_from_lastfm(artist_name, song_title)
@@ -1197,7 +1197,7 @@ def fetch_duration_with_fallback(artist_name: str, song_title: str) -> Tuple[Opt
     if duration:
         return duration, 'spotify'
 
-    # 3. Try DeepSeek
+    # 3. Try DeepSeek China
     duration = fetch_duration_from_deepseek(artist_name, song_title)
     if duration:
         return duration, 'deepseek'

@@ -106,14 +106,9 @@ load_dotenv()
 # Database paths
 ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '1_artist_genres.db')
 ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_albums_raw.db')
-# Separate TEST database — never touches the real data/3_songs_raw.db while
-# this tracklist-cache strategy is being evaluated.
-SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_songs_test_tracklist.db')
+SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_song_db_raw.db')
 
-# Cap for this test run: stop after this many NEW songs have been
-# processed (songs that already existed and were skipped don't count).
-# None = no cap, process everything.
-MAX_NEW_SONGS = 200
+MAX_NEW_SONGS = 10
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
@@ -1551,7 +1546,7 @@ def get_stats(conn):
 def create_database():
     print("=" * 60)
     cap_label = f"capped at {MAX_NEW_SONGS} new songs" if MAX_NEW_SONGS is not None else "no cap — full run"
-    print(f"SONG DATABASE - TRACKLIST CACHE TEST ({cap_label})")
+    print(f"SONG DATABASE - RAW DATA FETCHER ({cap_label})")
     print("=" * 60)
 
     if not LASTFM_API_KEY or not LASTFM_USER:

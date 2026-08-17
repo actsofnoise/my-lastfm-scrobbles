@@ -108,7 +108,7 @@ ARTIST_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data'
 ALBUM_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '2_albums_raw.db')
 SONG_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', '3_song_db_raw.db')
 
-MAX_NEW_SONGS = 14
+MAX_NEW_SONGS = 39
 
 # --- Credentials ---
 LASTFM_API_KEY = os.environ.get('LASTFM_API_KEY')
